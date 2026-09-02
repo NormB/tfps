@@ -186,6 +186,13 @@ the same category as rtpengine, rtpproxy, Asterisk, OpenSIPS and Kamailio: other
 people's projects that may be on the system, and may not. sipnab must never
 carry a hard requirement on any of them.**
 
+**The primary case is a machine with none of them.** A laptop with no TFPS, no
+rtpengine, no OpenSIPS, no Kamailio and no Asterisk must run sipnab and capture
+traffic, normally and without comment. That is not a fallback path to be
+tolerated; it is the ordinary way sipnab is used, and every optional integration
+is measured against it. Nothing R1 adds may warn, error, degrade, or ask for
+configuration on such a machine.
+
 sipnab already has the pattern and R1 follows it rather than inventing one.
 `--rtpengine-control` is an `Option<String>` (`src/cli.rs:1490`) and every
 consumer is an `if let Some(...)` (`src/app/bootstrap.rs:637`,
@@ -249,7 +256,7 @@ Per change, with its negative control:
 | 5.3 unban writer | unban of a blocked IP writes `unban_log` | unban of an unblocked IP writes nothing |
 | 5.4 export | join produces all three verdicts | absent values are `null`, not missing |
 | 6 harness | scoring math against synthetic labels | skips cleanly when `TFPS_LABELS` is unset |
-| 6.1 absence is normal | sipnab's full suite passes with no TFPS installed, no labels, no config naming it | the manifest gate fails if a `tfps`/`tfps-core` dependency is ever added |
+| 6.1 bare machine | a host with no TFPS, rtpengine, OpenSIPS, Kamailio or Asterisk captures traffic normally, with no warning or degraded mode | the manifest gate fails if a `tfps`/`tfps-core` dependency is ever added |
 
 Every new gate is mutation-tested: break what it guards, confirm red, restore,
 and prove the restore with `cmp -s` against a pre-mutation copy.
