@@ -127,3 +127,37 @@ fn the_workflow_has_only_keys_github_will_accept() {
         );
     }
 }
+
+// ---- Owed: the two gate shortfalls ----
+
+/// Debt 3. Asserting the gate runs the right commands says nothing about
+/// whether it ever runs. A workflow with no trigger is a file.
+#[test]
+fn the_gate_actually_fires_on_pushes_and_pull_requests() {
+    let w = workflow();
+    assert!(
+        w.contains("pull_request:"),
+        "no pull_request trigger: a branch could be merged with the gate never run"
+    );
+    assert!(
+        w.contains("push:"),
+        "no push trigger: work pushed straight to a branch would go unchecked"
+    );
+}
+
+/// Debt 5. Sixty-eight merges fired three workflow runs per commit and buried
+/// the queue 135 deep, and 99 had to be cancelled by hand. The concurrency
+/// group is what stops that, and it is exactly the sort of line that gets
+/// dropped in a later edit without anyone noticing until the queue is full.
+#[test]
+fn superseded_runs_are_cancelled() {
+    let w = workflow();
+    assert!(
+        w.contains("concurrency:"),
+        "no concurrency group: a queue of merges will run CI for commits already superseded"
+    );
+    assert!(
+        w.contains("cancel-in-progress: true"),
+        "the concurrency group must cancel superseded runs, not merely serialise them"
+    );
+}

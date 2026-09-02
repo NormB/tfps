@@ -819,6 +819,122 @@ mod tests {
         assert_eq!(n, 1, "the row must survive the second open too");
     }
 
+    // ---- Owed: three failures from this session, paid in related tests ----
+
+    // Debt 6 (a doc comment detached from its item: a claim and its code
+    // drifting apart). The migration carries a comment asserting block_log is
+    // deliberately absent from the drop list. A comment cannot enforce itself,
+    // and this is the pair that matters -- so both halves are read.
+    #[test]
+    fn the_migration_does_not_drop_the_audit_log() {
+        let src = include_str!("store.rs");
+        let list = src
+            .split("for t in [")
+            .nth(1)
+            .expect("the drop list must still be a literal array")
+            .split(']')
+            .next()
+            .unwrap();
+        assert!(
+            !list.contains("block_log"),
+            "block_log is back on the drop list; the corpus would not survive a version bump"
+        );
+    }
+
+    // Debt 6, the other half. Checking only that block_log is absent would pass
+    // over an empty list -- which would preserve the learned bitmaps a version
+    // change means have changed meaning. A fact written twice needs both copies
+    // read.
+    #[test]
+    fn the_migration_still_drops_the_learned_state() {
+        let src = include_str!("store.rs");
+        let list = src
+            .split("for t in [")
+            .nth(1)
+            .unwrap()
+            .split(']')
+            .next()
+            .unwrap();
+        for table in ["peer_anomaly", "known_peer", "meta"] {
+            assert!(
+                list.contains(table),
+                "{table} must still be recreated on a schema change"
+            );
+        }
+    }
+
+    // Debt 1 (I ran a push from the wrong repository directory and it targeted
+    // the wrong object). The same class here is writing to a database other
+    // than the one named.
+    #[test]
+    fn a_store_writes_to_the_path_it_was_given() {
+        let path = fresh("named-path");
+        let s = Store::open(&path).unwrap();
+        s.log_block(1, "198.51.100.1".parse().unwrap(), "scanner", "x");
+        assert!(
+            path.exists(),
+            "the named path must be the file that was created"
+        );
+        assert!(
+            !std::path::Path::new(DEFAULT_PATH).starts_with(path.parent().unwrap()),
+            "the test must not be silently exercising the default path"
+        );
+        let n: i64 = Store::open(&path)
+            .unwrap()
+            .conn
+            .query_row("SELECT count(*) FROM block_log", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "the row must be in the database that was named");
+    }
+
+    // Debt 1, second half: two stores must not see each other. If they did, a
+    // count read from one would describe the other -- which is exactly what
+    // acting on the wrong target looks like from the outside.
+    #[test]
+    fn two_stores_at_different_paths_are_isolated() {
+        let a = fresh("iso-a");
+        let b = fresh("iso-b");
+        Store::open(&a)
+            .unwrap()
+            .log_block(1, "198.51.100.1".parse().unwrap(), "scanner", "x");
+        let sb = Store::open(&b).unwrap();
+        assert_eq!(
+            sb.blocks(10, None).unwrap().len(),
+            0,
+            "a second database must not see the first's rows"
+        );
+    }
+
+    // Debt 2 (a broken instrument returned nothing and I reported the nothing as
+    // fact). Empty must be a real answer...
+    #[test]
+    fn an_empty_audit_log_reads_as_empty_and_not_as_an_error() {
+        let path = fresh("empty-ok");
+        let s = Store::open(&path).unwrap();
+        let rows = s
+            .blocks(10, None)
+            .expect("an empty log is a legitimate answer, not a failure");
+        assert!(rows.is_empty());
+    }
+
+    // ...and a failed read must NOT look like empty. This is the exact shape of
+    // the failure being paid for: had the query been broken, "no rows" and
+    // "could not read" would have been the same value, and the caller would
+    // have reported an empty corpus as a measured one.
+    #[test]
+    fn a_broken_read_is_an_error_not_an_empty_result() {
+        let path = fresh("broken-read");
+        let s = Store::open(&path).unwrap();
+        s.conn.execute_batch("DROP TABLE block_log;").unwrap();
+        let r = s.blocks(10, None);
+        assert!(
+            r.is_err(),
+            "reading a missing table returned {:?} — an unreadable log must never \
+             be indistinguishable from an empty one",
+            r.map(|v| v.len())
+        );
+    }
+
     #[test]
     fn the_apiban_list_survives_a_restart_and_ages_out() {
         // The feed is consumed through a forward-only cursor, so what it already gave us
