@@ -225,6 +225,30 @@ which is the default state in CI and on every machine that never installs it.
 The corpus test skips exactly as its sibling `scanner_signature_corpus_test.rs`
 does when `SIPNAB_CORPUS` is unset.
 
+### 6.2 Cardinality is 0..N, and each is independent
+
+A bare laptop has none. An SBC may have several at once — TFPS and rtpengine and
+OpenSIPS and Asterisk on one box. The count is not a binary and the design does
+not treat it as one.
+
+Each optional integration is independently optional. The presence of rtpengine
+must not change how TFPS labels are read, and the presence of TFPS must not
+change anything about rtpengine attribution. No integration may imply,
+require, or configure another. That is already true of the existing ones and R1
+does not become the first exception.
+
+**On an SBC, the identity assumption is the one that breaks.** R1 Mode A joins a
+label to a capture on the source address, which is exact and free when both
+tools tap one interface on one host. An SBC performing NAT or topology hiding
+between the two observation points breaks that join, and neither tool will say
+so. This is the review's Mode B "identity" precondition, and an SBC is its
+canonical case rather than an exotic one. Mode A on opensips-1 does not hit it —
+one interface, one clock, one address space — but the harness keeps the join
+behind a seam (§6) precisely so the SBC case can be answered later without
+restructuring, and the harness refuses a pairing whose source-address sets
+barely intersect rather than reporting a confident score over a mostly-failed
+join.
+
 ## 7. Deployment — opensips-1 (carbon VM 140)
 
 Measured this session: Debian 13, kernel 6.12.105, `eth0` on `virtio_net`,
@@ -256,6 +280,7 @@ Per change, with its negative control:
 | 5.3 unban writer | unban of a blocked IP writes `unban_log` | unban of an unblocked IP writes nothing |
 | 5.4 export | join produces all three verdicts | absent values are `null`, not missing |
 | 6 harness | scoring math against synthetic labels | skips cleanly when `TFPS_LABELS` is unset |
+| 6.2 several peers | TFPS labels read correctly on a host also running rtpengine; rtpengine attribution unchanged by TFPS being present | neither integration configures or implies the other |
 | 6.1 bare machine | a host with no TFPS, rtpengine, OpenSIPS, Kamailio or Asterisk captures traffic normally, with no warning or degraded mode | the manifest gate fails if a `tfps`/`tfps-core` dependency is ever added |
 
 Every new gate is mutation-tested: break what it guards, confirm red, restore,
