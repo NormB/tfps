@@ -33,7 +33,7 @@ pub const DEFAULT_PATH: &str = "/var/lib/tfps/tfps.db";
 /// Schema version. An incompatible change recreates the tables rather than corrupting —
 /// losing a baseline is recoverable in days; reading a bitmap with the wrong semantics is
 /// not.
-const SCHEMA: i64 = 1;
+const SCHEMA: i64 = 2;
 
 /// A source's learned state, as stored — for the control tool.
 pub struct SourceRow {
@@ -126,14 +126,13 @@ impl Store {
             .unwrap_or(0);
         if found != 0 && found != SCHEMA {
             // Incompatible schema: start over. See the note on `SCHEMA`.
-            for t in [
-                "peer_anomaly",
-                "known_peer",
-                "pair",
-                "peer_country",
-                "meta",
-                "block_log",
-            ] {
+            // `block_log` is deliberately NOT here. The rationale on `SCHEMA` —
+            // losing a baseline is recoverable in days — is true of learned state
+            // and false of an audit log: it cannot be relearned from traffic, and
+            // under R1 it IS the labeled corpus, which is weeks of collection.
+            // Dropping it to add a column to it would destroy the thing the column
+            // exists to describe. Its columns are migrated below instead.
+            for t in ["peer_anomaly", "known_peer", "pair", "peer_country", "meta"] {
                 let _ = self.conn.execute(&format!("DROP TABLE IF EXISTS {t}"), []);
             }
         }
@@ -175,9 +174,33 @@ impl Store {
                  CREATE TABLE IF NOT EXISTS apiban_ip (
                      ip TEXT PRIMARY KEY,
                      ts INTEGER NOT NULL
-                 );",
+                 );
+                 -- Hard negatives: a source that tripped a rule and was trusted anyway.
+                 -- The most valuable label there is, because it looked hostile and was not.
+                 CREATE TABLE IF NOT EXISTS exempt_log (
+                     ts     INTEGER NOT NULL,
+                     ip     TEXT    NOT NULL,
+                     reason TEXT    NOT NULL,
+                     detail TEXT    NOT NULL,
+                     rule   TEXT    NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS exempt_log_ts ON exempt_log (ts);
+                 -- Gold negatives: a human saying the machine was wrong. SPEC 12 makes
+                 -- manual unblocking the precision proxy; until now it was never recorded.
+                 CREATE TABLE IF NOT EXISTS unban_log (
+                     ts    INTEGER NOT NULL,
+                     ip    TEXT    NOT NULL,
+                     actor TEXT    NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS unban_log_ip ON unban_log (ip);",
             )
             .map_err(|e| format!("creating schema: {e}"))?;
+        // Columns added to a table that survives the version change. SQLite has no
+        // ADD COLUMN IF NOT EXISTS, and a second open would fail on an ALTER that
+        // already ran, so the presence check is the idempotence.
+        self.add_column_if_missing("block_log", "enforced", "INTEGER NOT NULL DEFAULT 1")?;
+        self.add_column_if_missing("block_log", "expires", "INTEGER")?;
+
         self.conn
             .pragma_update(None, "user_version", SCHEMA)
             .map_err(|e| format!("user_version: {e}"))
@@ -342,6 +365,33 @@ impl Store {
     ///
     /// Read-only on purpose: `tfps_ctl` inspecting state must not be able to corrupt what
     /// the daemon is writing, and WAL lets it read while a checkpoint is in flight.
+    /// Add a column unless it is already there.
+    ///
+    /// The default matters and is not arbitrary: every row written before
+    /// `enforced` existed came from the enforcing arm, because that was the only
+    /// arm that wrote anything. Defaulting them to 1 records what actually
+    /// happened rather than guessing.
+    fn add_column_if_missing(&self, table: &str, column: &str, decl: &str) -> Result<(), String> {
+        let present: i64 = self
+            .conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info(?1) WHERE name = ?2",
+                params![table, column],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("inspecting {table}: {e}"))?;
+        if present > 0 {
+            return Ok(());
+        }
+        self.conn
+            .execute(
+                &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+                [],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("adding {table}.{column}: {e}"))
+    }
+
     pub fn open_readonly(path: &Path) -> Result<Self, String> {
         use rusqlite::OpenFlags;
         let conn = Connection::open_with_flags(
@@ -609,6 +659,142 @@ mod tests {
     fn invite(from: &str, dialed: &str) -> Vec<u8> {
         format!("INVITE sip:{dialed}@pbx SIP/2.0\r\nFrom: <sip:{from}@pbx>;tag=t\r\n\r\n")
             .into_bytes()
+    }
+
+    // ---- R1: the audit log is the corpus, and must survive a schema change ----
+
+    /// Build a database as the previous schema version left it, then reopen it
+    /// with the current code. `user_version` is forced rather than faked so the
+    /// migration takes the same path a real upgrade takes.
+    fn v1_database_with_a_block(path: &std::path::Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS block_log (
+                 ts INTEGER NOT NULL, ip TEXT NOT NULL,
+                 reason TEXT NOT NULL, detail TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS peer_anomaly (
+                 peer TEXT PRIMARY KEY, seen BLOB NOT NULL, n_countries INTEGER NOT NULL,
+                 rate_a REAL NOT NULL, rate_b REAL NOT NULL,
+                 last_seen INTEGER NOT NULL DEFAULT 0);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO block_log (ts, ip, reason, detail) VALUES (10, '198.51.100.7', 'scanner', 'sipvicious')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO peer_anomaly VALUES ('198.51.100.9', X'00', 1, 0.0, 0.0, 5)",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 1i64).unwrap();
+    }
+
+    fn fresh(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "tfps-r1-{}-{}-{name}",
+            std::process::id(),
+            std::thread::current()
+                .name()
+                .unwrap_or("t")
+                .replace("::", "-")
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.join("tfps.db")
+    }
+
+    // THE SCENARIO. Learned state is relearned in minutes, which is why the
+    // migration drops it. An audit log cannot be relearned at all, and under R1
+    // it is the labeled corpus -- weeks of collection. Dropping it on a version
+    // bump would destroy the product to add a column to it.
+    #[test]
+    fn the_audit_log_survives_a_schema_upgrade() {
+        let path = fresh("survive");
+        v1_database_with_a_block(&path);
+        let s = Store::open(&path).unwrap();
+        let n: i64 = s
+            .conn
+            .query_row("SELECT count(*) FROM block_log", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            n, 1,
+            "the audit log was dropped by the upgrade — that is the corpus"
+        );
+        let (ip, reason): (String, String) = s
+            .conn
+            .query_row("SELECT ip, reason FROM block_log", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((ip.as_str(), reason.as_str()), ("198.51.100.7", "scanner"));
+    }
+
+    // Rows written before the column existed were all written by the enforcing
+    // arm, because it was the only arm that wrote. Defaulting them to enforced
+    // is therefore true, not merely convenient.
+    #[test]
+    fn rows_predating_the_column_read_as_enforced() {
+        let path = fresh("default");
+        v1_database_with_a_block(&path);
+        let s = Store::open(&path).unwrap();
+        let enforced: i64 = s
+            .conn
+            .query_row("SELECT enforced FROM block_log", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(enforced, 1, "a pre-upgrade row must read as enforced");
+    }
+
+    // NEGATIVE CONTROL. Preserving the audit log must not accidentally preserve
+    // the learned bitmaps, whose semantics are exactly what a version change
+    // means has changed. Reading those with the wrong meaning is the corruption
+    // the drop exists to prevent.
+    #[test]
+    fn learned_state_is_still_discarded_on_a_schema_change() {
+        let path = fresh("drop-learned");
+        v1_database_with_a_block(&path);
+        let s = Store::open(&path).unwrap();
+        let n: i64 = s
+            .conn
+            .query_row("SELECT count(*) FROM peer_anomaly", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            n, 0,
+            "learned state must still be recreated, not carried across"
+        );
+    }
+
+    #[test]
+    fn the_label_tables_exist_after_migration() {
+        let path = fresh("tables");
+        let s = Store::open(&path).unwrap();
+        for table in ["exempt_log", "unban_log", "block_log"] {
+            let n: i64 = s
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    params![table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{table} must exist");
+        }
+    }
+
+    // Opening twice must not fail. Adding a column is not idempotent in SQLite,
+    // so the second open is where a naive ALTER blows up.
+    #[test]
+    fn opening_an_already_migrated_database_is_a_no_op() {
+        let path = fresh("idempotent");
+        v1_database_with_a_block(&path);
+        Store::open(&path).unwrap();
+        let s = Store::open(&path).expect("a second open must succeed");
+        let n: i64 = s
+            .conn
+            .query_row("SELECT count(*) FROM block_log", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "the row must survive the second open too");
     }
 
     #[test]
