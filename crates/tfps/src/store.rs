@@ -32,6 +32,7 @@ use std::path::Path;
 
 use rusqlite::{params, Connection};
 use tfps_core::country;
+use tfps_core::disposition::Disposition;
 use tfps_core::engine::{Engine, PeerAnomalyRecord};
 
 /// Where the database lives unless `--db` says otherwise.
@@ -242,10 +243,15 @@ impl Store {
                 return t;
             }
         }
-        let _ = self.conn.execute(
+        if let Err(e) = self.conn.execute(
             "INSERT OR REPLACE INTO meta (k, v) VALUES ('learning_started', ?1)",
             params![default_now.to_string()],
-        );
+        ) {
+            // Not fatal: learning proceeds from `default_now` either way. Not
+            // silent either, because the next boot would restart the clock and
+            // the operator would see the learning window reset for no reason.
+            eprintln!("WARNING: could not persist the learning start: {e}");
+        }
         default_now
     }
 
@@ -360,19 +366,110 @@ impl Store {
     /// Writes one. Failure is not fatal: the worst case is refetching a feed from the
     /// start, which costs bandwidth, not correctness.
     pub fn meta_set(&self, key: &str, value: &str) {
-        let _ = self.conn.execute(
+        if let Err(e) = self.conn.execute(
             "INSERT OR REPLACE INTO meta (k, v) VALUES (?1, ?2)",
             params![key, value],
-        );
+        ) {
+            // `meta` carries the APIBAN cursor, and the schema comment says what
+            // losing it costs: the integration "silently protects nothing after
+            // a restart". A dropped write here has to be audible.
+            eprintln!("WARNING: could not persist meta {key}: {e}");
+        }
     }
 
-    /// Records a condemnation. Best effort: a failed audit write must never stop
-    /// the block it describes.
-    pub fn log_block(&self, ts: u32, ip: Ipv4Addr, reason: &str, detail: &str) {
-        let _ = self.conn.execute(
-            "INSERT INTO block_log (ts, ip, reason, detail) VALUES (?1, ?2, ?3, ?4)",
-            params![ts, ip.to_string(), reason, detail],
-        );
+    /// Records what the perimeter decided, wherever that decision belongs.
+    ///
+    /// Takes the [`Disposition`] rather than loose fields so a caller cannot
+    /// record a verdict and a reason that disagree: they were decided together
+    /// and they are written together. The verdict *name* is deliberately not
+    /// stored — it is a function of `enforced`, and a column would be the same
+    /// fact written twice, free to drift.
+    ///
+    /// Returns an error rather than swallowing one. A failed audit write must
+    /// not stop the block it describes, and the caller enforces that by not
+    /// treating this as fatal — but silence here would lose the corpus a row at
+    /// a time, which is exactly the failure nobody notices.
+    pub fn log_decision(
+        &self,
+        ts: u32,
+        ip: Ipv4Addr,
+        d: &Disposition<'_>,
+        ttl: u64,
+    ) -> Result<(), String> {
+        match d {
+            Disposition::Ignore => Ok(()),
+            Disposition::Block { kind, detail } => {
+                // 0 is "never" throughout this codebase, including the APIBAN
+                // path. Storing ts+0 would claim the block lapsed as it was made.
+                let expires: i64 = if ttl == 0 {
+                    0
+                } else {
+                    // Saturating: a TTL large enough to overflow is a
+                    // configuration error, and clamping is better than wrapping
+                    // to a lapse time in the past.
+                    i64::from(ts).saturating_add(i64::try_from(ttl).unwrap_or(i64::MAX))
+                };
+                self.conn
+                    .execute(
+                        "INSERT INTO block_log (ts, ip, reason, detail, enforced, expires)
+                         VALUES (?1, ?2, ?3, ?4, 1, ?5)",
+                        params![ts, ip.to_string(), kind, detail, expires],
+                    )
+                    .map(|_| ())
+                    .map_err(|e| format!("recording a block for {ip}: {e}"))
+            }
+            Disposition::WouldBlock { kind, detail } => self
+                .conn
+                .execute(
+                    // No expiry: nothing was blocked, so there is no TTL to record.
+                    // A number here would be a lapse time for a block that never was.
+                    "INSERT INTO block_log (ts, ip, reason, detail, enforced, expires)
+                     VALUES (?1, ?2, ?3, ?4, 0, NULL)",
+                    params![ts, ip.to_string(), kind, detail],
+                )
+                .map(|_| ())
+                .map_err(|e| format!("recording a would-block for {ip}: {e}")),
+            Disposition::ExemptIgnoreIp { kind, detail, rule } => {
+                self.log_exempt(ts, ip, kind, detail, rule)
+            }
+            Disposition::ExemptKnownPeer { kind, detail } => {
+                // Named rather than left blank: a learned registration and a
+                // curated list are different strengths of evidence, and the
+                // corpus has to be able to tell them apart.
+                self.log_exempt(ts, ip, kind, detail, "registered-peer")
+            }
+        }
+    }
+
+    fn log_exempt(
+        &self,
+        ts: u32,
+        ip: Ipv4Addr,
+        reason: &str,
+        detail: &str,
+        rule: &str,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO exempt_log (ts, ip, reason, detail, rule) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![ts, ip.to_string(), reason, detail, rule],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("recording an exemption for {ip}: {e}"))
+    }
+
+    /// Records a lifted block — the gold negative, a human saying this was wrong.
+    ///
+    /// `actor` exists so that a TTL lapsing can never be counted as an operator
+    /// judgement. Only `operator` rows are negatives.
+    pub fn log_unban(&self, ts: u32, ip: Ipv4Addr, actor: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO unban_log (ts, ip, actor) VALUES (?1, ?2, ?3)",
+                params![ts, ip.to_string(), actor],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("recording an unban for {ip}: {e}"))
     }
 
     /// Deletes old audit rows. Without this the file grows forever — which is what
@@ -870,7 +967,8 @@ mod tests {
     fn a_store_writes_to_the_path_it_was_given() {
         let path = fresh("named-path");
         let s = Store::open(&path).unwrap();
-        s.log_block(1, "198.51.100.1".parse().unwrap(), "scanner", "x");
+        s.log_decision(1, "198.51.100.1".parse().unwrap(), &dispo_block(), 3600)
+            .unwrap();
         assert!(
             path.exists(),
             "the named path must be the file that was created"
@@ -896,7 +994,8 @@ mod tests {
         let b = fresh("iso-b");
         Store::open(&a)
             .unwrap()
-            .log_block(1, "198.51.100.1".parse().unwrap(), "scanner", "x");
+            .log_decision(1, "198.51.100.1".parse().unwrap(), &dispo_block(), 3600)
+            .unwrap();
         let sb = Store::open(&b).unwrap();
         assert_eq!(
             sb.blocks(10, None).unwrap().len(),
@@ -932,6 +1031,172 @@ mod tests {
             "reading a missing table returned {:?} — an unreadable log must never \
              be indistinguishable from an empty one",
             r.map(|v| v.len())
+        );
+    }
+
+    // ---- R1: recording what was decided ----
+
+    fn dispo_block() -> tfps_core::disposition::Disposition<'static> {
+        tfps_core::disposition::Disposition::Block {
+            kind: "scanner",
+            detail: "sipvicious",
+        }
+    }
+
+    #[test]
+    fn a_block_records_its_verdict_and_when_it_lapses() {
+        let path = fresh("rec-block");
+        let s = Store::open(&path).unwrap();
+        s.log_decision(100, "198.51.100.1".parse().unwrap(), &dispo_block(), 3600)
+            .unwrap();
+        let (enforced, expires): (i64, Option<i64>) = s
+            .conn
+            .query_row("SELECT enforced, expires FROM block_log", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(enforced, 1);
+        assert_eq!(expires, Some(3700), "expires is ts + ttl, absolute");
+    }
+
+    // A TTL of 0 means forever, and the APIBAN path already uses it that way.
+    // Storing ts+0 would claim the block lapsed the instant it was made.
+    #[test]
+    fn a_ttl_of_zero_records_never_rather_than_now() {
+        let path = fresh("rec-forever");
+        let s = Store::open(&path).unwrap();
+        s.log_decision(100, "198.51.100.1".parse().unwrap(), &dispo_block(), 0)
+            .unwrap();
+        let expires: Option<i64> = s
+            .conn
+            .query_row("SELECT expires FROM block_log", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(expires, Some(0), "0 means never, not 'expired at ts'");
+    }
+
+    // The observe-only label. No TTL exists because nothing was blocked, so
+    // `expires` must be null rather than a number nobody can act on.
+    #[test]
+    fn a_would_block_records_no_expiry_because_nothing_was_blocked() {
+        let path = fresh("rec-would");
+        let s = Store::open(&path).unwrap();
+        let d = tfps_core::disposition::Disposition::WouldBlock {
+            kind: "injection",
+            detail: "'",
+        };
+        s.log_decision(100, "198.51.100.2".parse().unwrap(), &d, 3600)
+            .unwrap();
+        let (enforced, expires): (i64, Option<i64>) = s
+            .conn
+            .query_row("SELECT enforced, expires FROM block_log", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(enforced, 0);
+        assert_eq!(
+            expires, None,
+            "a TTL that was never applied must not be recorded"
+        );
+    }
+
+    // The hard negative, and the rule that spared it -- an operator's curated
+    // list and a learned registration are different strengths of evidence.
+    #[test]
+    fn an_exemption_records_which_rule_spared_it() {
+        let path = fresh("rec-exempt");
+        let s = Store::open(&path).unwrap();
+        let d = tfps_core::disposition::Disposition::ExemptIgnoreIp {
+            kind: "scanner",
+            detail: "sipvicious",
+            rule: "10.0.0.0/8",
+        };
+        s.log_decision(100, "198.51.100.3".parse().unwrap(), &d, 3600)
+            .unwrap();
+        let (ip, rule): (String, String) = s
+            .conn
+            .query_row("SELECT ip, rule FROM exempt_log", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((ip.as_str(), rule.as_str()), ("198.51.100.3", "10.0.0.0/8"));
+        let n: i64 = s
+            .conn
+            .query_row("SELECT count(*) FROM block_log", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            n, 0,
+            "an exemption is not a block and must not enter the block log"
+        );
+    }
+
+    #[test]
+    fn a_registered_peer_exemption_names_itself_as_the_rule() {
+        let path = fresh("rec-known");
+        let s = Store::open(&path).unwrap();
+        let d = tfps_core::disposition::Disposition::ExemptKnownPeer {
+            kind: "auth-failed",
+            detail: "rejected",
+        };
+        s.log_decision(100, "198.51.100.4".parse().unwrap(), &d, 3600)
+            .unwrap();
+        let rule: String = s
+            .conn
+            .query_row("SELECT rule FROM exempt_log", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rule, "registered-peer");
+    }
+
+    // NEGATIVE CONTROL: silence writes nothing at all. If `Ignore` produced a
+    // row, every benign packet would enter the corpus as a label.
+    #[test]
+    fn silence_records_nothing() {
+        let path = fresh("rec-silence");
+        let s = Store::open(&path).unwrap();
+        s.log_decision(
+            100,
+            "198.51.100.5".parse().unwrap(),
+            &tfps_core::disposition::Disposition::Ignore,
+            3600,
+        )
+        .unwrap();
+        for table in ["block_log", "exempt_log"] {
+            let n: i64 = s
+                .conn
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 0, "{table} must be empty");
+        }
+    }
+
+    // The gold negative. `actor` exists so a TTL lapse can never be counted as a
+    // human saying the machine was wrong.
+    #[test]
+    fn an_unban_records_who_lifted_it() {
+        let path = fresh("rec-unban");
+        let s = Store::open(&path).unwrap();
+        s.log_unban(200, "198.51.100.6".parse().unwrap(), "operator")
+            .unwrap();
+        let (ip, actor): (String, String) = s
+            .conn
+            .query_row("SELECT ip, actor FROM unban_log", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((ip.as_str(), actor.as_str()), ("198.51.100.6", "operator"));
+    }
+
+    // A failed audit write must not stop the block -- but it must not be silent
+    // either. The old signature returned nothing at all, so a corpus could lose
+    // every row and read as a quiet success.
+    #[test]
+    fn a_failed_audit_write_is_reported_rather_than_swallowed() {
+        let path = fresh("rec-fail");
+        let s = Store::open(&path).unwrap();
+        s.conn.execute_batch("DROP TABLE block_log;").unwrap();
+        let r = s.log_decision(100, "198.51.100.7".parse().unwrap(), &dispo_block(), 3600);
+        assert!(
+            r.is_err(),
+            "a lost label must be reported; silence here loses the corpus a row at a time"
         );
     }
 
@@ -1047,8 +1312,10 @@ mod tests {
         let path = tmp().with_extension("log.db");
         let _ = std::fs::remove_file(&path);
         let s = Store::open(&path).unwrap();
-        s.log_block(100, Ipv4Addr::new(1, 2, 3, 4), "user-agent", "pplsip");
-        s.log_block(200, Ipv4Addr::new(5, 6, 7, 8), "injection", "'");
+        s.log_decision(100, Ipv4Addr::new(1, 2, 3, 4), &dispo_block(), 3600)
+            .unwrap();
+        s.log_decision(200, Ipv4Addr::new(5, 6, 7, 8), &dispo_block(), 3600)
+            .unwrap();
         assert_eq!(s.prune_log(150), 1, "only the oldest one goes");
         let remaining: i64 = s
             .conn

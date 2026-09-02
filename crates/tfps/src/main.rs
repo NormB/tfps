@@ -692,12 +692,13 @@ fn main() -> ExitCode {
                     let exempt = reason.and_then(|_| ignoreip.exempt(subject));
                     // Decided as a total match, not a chain: the defect this replaces was a
                     // missing `else`, and an enum the compiler checks cannot lose an arm.
-                    match disposition(
+                    let decided = disposition(
                         reason,
                         exempt,
                         reason.is_some() && engine.is_known_peer(subject, t),
                         enforcer.is_some(),
-                    ) {
+                    );
+                    match decided {
                         Disposition::Ignore => {}
                         Disposition::ExemptIgnoreIp { kind, detail, rule } => {
                             // Judged, reported, not enforced. Staying silent here would hide a
@@ -725,19 +726,28 @@ fn main() -> ExitCode {
                                 continue;
                             };
                             match e.block(subject, args.block_ttl) {
-                                Ok(()) => {
-                                    say!(
-                                        "BLOCKED peer={subject} reason={kind} detail={detail} ttl={}s",
-                                        args.block_ttl
-                                    );
-                                    // Durable audit: the operator must be able to reconstruct
-                                    // the decision later, without relying on the journal.
-                                    if let Some(s) = db.as_ref() {
-                                        s.log_block(t.0, subject, kind, detail);
-                                    }
+                                Ok(()) => say!(
+                                    "BLOCKED peer={subject} reason={kind} detail={detail} ttl={}s",
+                                    args.block_ttl
+                                ),
+                                Err(err) => {
+                                    // Nothing was blocked, so nothing is recorded: an audit
+                                    // row for a block that did not happen is a false label.
+                                    eprintln!("ALARM: could not block {subject}: {err}");
+                                    continue;
                                 }
-                                Err(err) => eprintln!("ALARM: could not block {subject}: {err}"),
                             }
+                        }
+                    }
+                    // Durable audit, in ONE place for every judged outcome. Per-arm
+                    // recording is what let the observe-only verdict go unwritten:
+                    // an arm that forgets to record looks exactly like an arm that
+                    // had nothing to record.
+                    if let Some(s) = db.as_ref() {
+                        if let Err(err) = s.log_decision(t.0, subject, &decided, args.block_ttl) {
+                            // Never fatal -- protection outranks bookkeeping -- but never
+                            // silent either: a lost label is a corpus with a hole in it.
+                            eprintln!("WARNING: {err}");
                         }
                     }
                     if args.debug_unparsed
@@ -801,7 +811,15 @@ fn main() -> ExitCode {
                     }
                     // No expiry: the APIBAN list is curated, and re-applying it hourly
                     // would only generate pointless writes.
-                    let _ = e.block(ip, 0);
+                    if let Err(err) = e.block(ip, 0) {
+                        // The perimeter's own block path alarms on this; the feed's
+                        // did not, so a refused kernel write still counted toward
+                        // "N addresses condemned" and the tool reported protection
+                        // it had not applied.
+                        eprintln!("ALARM: could not block {ip} from the APIBAN feed: {err}");
+                        n -= 1;
+                        continue;
+                    }
                 }
                 if n > 0 {
                     apiban_total += n as u64;
