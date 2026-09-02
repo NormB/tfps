@@ -21,6 +21,12 @@
 //! minutes from traffic — consistent with fail-open by not pinning the eBPF program. The
 //! **behavioural** state, 45 to 90 days of it, is what has to survive.
 
+// A detached doc comment is invisible to the compiler and to every test: an
+// edit spliced between a doc block and its item once left `open_readonly`
+// undocumented while its text described a private helper. `missing_docs` is the
+// only instrument that sees that, so it is denied here.
+#![deny(missing_docs)]
+
 use std::net::Ipv4Addr;
 use std::path::Path;
 
@@ -28,6 +34,7 @@ use rusqlite::{params, Connection};
 use tfps_core::country;
 use tfps_core::engine::{Engine, PeerAnomalyRecord};
 
+/// Where the database lives unless `--db` says otherwise.
 pub const DEFAULT_PATH: &str = "/var/lib/tfps/tfps.db";
 
 /// Schema version. An incompatible change recreates the tables rather than corrupting —
@@ -37,10 +44,15 @@ const SCHEMA: i64 = 2;
 
 /// A source's learned state, as stored — for the control tool.
 pub struct SourceRow {
+    /// The source address, as text.
     pub peer: String,
+    /// The 256-bit country set, as stored: 32 bytes, one bit per country.
     pub seen: Vec<u8>,
+    /// How many distinct countries this source has attempted.
     pub n_countries: u32,
+    /// The fast arm of the two-rate novelty estimate.
     pub rate_a: f64,
+    /// When this source was last heard, as a Unix timestamp.
     pub last_seen: u32,
 }
 
@@ -56,17 +68,23 @@ impl SourceRow {
 
 /// One audit row.
 pub struct BlockRow {
+    /// When the decision was reached, as a Unix timestamp.
     pub ts: u32,
+    /// The condemned source, as text.
     pub ip: String,
+    /// The rule that fired: `scanner`, `injection`, `auth-failed` and friends.
     pub reason: String,
+    /// What the rule matched — the signature, pattern or outcome.
     pub detail: String,
 }
 
 /// How an operator narrows a source search.
 pub struct SourceFilter<'a> {
+    /// Exactly this peer, when the operator named one.
     pub peer: Option<&'a str>,
     /// Only sources that have called this country (ISO label, case-insensitive).
     pub country: Option<&'a str>,
+    /// Stop after this many rows.
     pub limit: usize,
 }
 
@@ -94,11 +112,13 @@ impl SourceFilter<'_> {
     }
 }
 
+/// The durable half of TFPS: learned state, the audit log and the feed cursor.
 pub struct Store {
     conn: Connection,
 }
 
 impl Store {
+    /// Opens the database read-write, creating and migrating it as needed.
     pub fn open(path: &Path) -> Result<Self, String> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
@@ -346,6 +366,8 @@ impl Store {
         );
     }
 
+    /// Records a condemnation. Best effort: a failed audit write must never stop
+    /// the block it describes.
     pub fn log_block(&self, ts: u32, ip: Ipv4Addr, reason: &str, detail: &str) {
         let _ = self.conn.execute(
             "INSERT INTO block_log (ts, ip, reason, detail) VALUES (?1, ?2, ?3, ?4)",
@@ -361,10 +383,6 @@ impl Store {
             .unwrap_or(0)
     }
 
-    /// Opens the database **read-only**, for the control tool.
-    ///
-    /// Read-only on purpose: `tfps_ctl` inspecting state must not be able to corrupt what
-    /// the daemon is writing, and WAL lets it read while a checkpoint is in flight.
     /// Add a column unless it is already there.
     ///
     /// The default matters and is not arbitrary: every row written before
@@ -392,6 +410,10 @@ impl Store {
             .map_err(|e| format!("adding {table}.{column}: {e}"))
     }
 
+    /// Opens the database **read-only**, for the control tool.
+    ///
+    /// Read-only on purpose: `tfps_ctl` inspecting state must not be able to corrupt what
+    /// the daemon is writing, and WAL lets it read while a checkpoint is in flight.
     pub fn open_readonly(path: &Path) -> Result<Self, String> {
         use rusqlite::OpenFlags;
         let conn = Connection::open_with_flags(
