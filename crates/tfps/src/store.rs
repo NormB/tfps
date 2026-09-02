@@ -1053,16 +1053,31 @@ mod tests {
     // drifting apart). The migration carries a comment asserting block_log is
     // deliberately absent from the drop list. A comment cannot enforce itself,
     // and this is the pair that matters -- so both halves are read.
+    /// The drop list, read from the migration and nowhere else.
+    ///
+    /// Anchored on `fn migrate` on purpose. The naive form searched the whole
+    /// file for the first `for t in [`, and that search string itself appears
+    /// in this test file -- a pattern that matches the matcher, correct only
+    /// because `migrate` happens to sit above the tests. Move the tests, or add
+    /// another such loop earlier, and the gate reads the wrong array and still
+    /// passes. Same shape as a `pkill -f` pattern broad enough to match the
+    /// shell running it.
+    fn drop_list(src: &str) -> &str {
+        let body = src
+            .split_once("fn migrate")
+            .expect("the migration must still be called `migrate`")
+            .1;
+        body.split_once("for t in [")
+            .expect("the drop list must still be a literal array inside `migrate`")
+            .1
+            .split_once(']')
+            .expect("the drop list must be closed")
+            .0
+    }
+
     #[test]
     fn the_migration_does_not_drop_the_audit_log() {
-        let src = include_str!("store.rs");
-        let list = src
-            .split("for t in [")
-            .nth(1)
-            .expect("the drop list must still be a literal array")
-            .split(']')
-            .next()
-            .unwrap();
+        let list = drop_list(include_str!("store.rs"));
         assert!(
             !list.contains("block_log"),
             "block_log is back on the drop list; the corpus would not survive a version bump"
@@ -1075,14 +1090,7 @@ mod tests {
     // read.
     #[test]
     fn the_migration_still_drops_the_learned_state() {
-        let src = include_str!("store.rs");
-        let list = src
-            .split("for t in [")
-            .nth(1)
-            .unwrap()
-            .split(']')
-            .next()
-            .unwrap();
+        let list = drop_list(include_str!("store.rs"));
         for table in ["peer_anomaly", "known_peer", "meta"] {
             assert!(
                 list.contains(table),
@@ -1422,6 +1430,70 @@ mod tests {
         let path = fresh("export-empty");
         let s = Store::open(&path).unwrap();
         assert!(s.labels(50).expect("empty is an answer").is_empty());
+    }
+
+    // ---- Owed: a `pkill -f` pattern that matched the shell running it ----
+    //
+    // Cleaning up a throwaway process, I used a pattern broad enough to match
+    // my own command line, so the kill took out the shell and the `rm` after it
+    // never ran. The bracket trick that avoids it is in my notes; I used the
+    // naive form anyway.
+    //
+    // Nothing in this product matches processes, so the debt is paid against
+    // the same CLASS where it does appear here: a text matcher that can select
+    // the wrong thing -- itself included -- and still pass.
+
+    /// The anchor must reach the migration's array and not the first textual
+    /// match in the file. That is the property the naive extractor had only by
+    /// luck of ordering.
+    #[test]
+    fn the_drop_list_extractor_reads_the_migration_and_not_a_decoy() {
+        let decoyed = concat!(
+            "fn something_else() {\n",
+            "    for t in [\"block_log\", \"definitely_wrong\"] {}\n",
+            "}\n",
+            "fn migrate() {\n",
+            "    for t in [\"peer_anomaly\", \"known_peer\"] {}\n",
+            "}\n"
+        );
+        let list = drop_list(decoyed);
+        assert!(
+            list.contains("peer_anomaly"),
+            "the extractor read a decoy above the migration: {list:?}"
+        );
+        assert!(
+            !list.contains("block_log"),
+            "the extractor selected the wrong array and would report a failure \
+             that is not there: {list:?}"
+        );
+    }
+
+    /// POSITIVE CONTROL. The decoy test shows the anchor skips what precedes
+    /// the migration; this shows the anchoring is what does it, by proving the
+    /// unanchored search picks the decoy. Without it the test above could pass
+    /// for the wrong reason.
+    #[test]
+    fn the_unanchored_search_really_would_have_picked_the_decoy() {
+        let decoyed = concat!(
+            "fn something_else() {\n",
+            "    for t in [\"block_log\", \"definitely_wrong\"] {}\n",
+            "}\n",
+            "fn migrate() {\n",
+            "    for t in [\"peer_anomaly\"] {}\n",
+            "}\n"
+        );
+        let naive = decoyed
+            .split_once("for t in [")
+            .unwrap()
+            .1
+            .split_once(']')
+            .unwrap()
+            .0;
+        assert!(
+            naive.contains("block_log"),
+            "the unanchored form must demonstrably pick the decoy, or the \
+             anchoring above guards nothing"
+        );
     }
 
     #[test]
