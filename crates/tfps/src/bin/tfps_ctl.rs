@@ -38,6 +38,7 @@ USAGE: tfps_ctl <command> [options]
   peers                        sources by country breadth, when last heard
   countries <peer>             the countries a source has been seen to call
   log [--limit N] [--ip IP]    the block audit log, newest first
+  log --json                   every label as JSON Lines, for an external analyzer
   forget <peer> [--a NUMBER]   erase learned state (requires tfps stopped)
 
 SOURCE FILTERS:
@@ -60,6 +61,7 @@ struct Args {
     command: String,
     positional: Vec<String>,
     db: PathBuf,
+    json: bool,
     map: Option<PathBuf>,
     peer: Option<String>,
     a_number: Option<String>,
@@ -76,6 +78,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         command: String::new(),
         positional: Vec::new(),
         db: PathBuf::from(tfps::store::DEFAULT_PATH),
+        json: false,
         map: None,
         peer: None,
         a_number: None,
@@ -100,6 +103,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--a" => a.a_number = Some(value("--a", &mut it)?),
             "--country" => a.country = Some(value("--country", &mut it)?),
             "--ip" => a.ip = Some(value("--ip", &mut it)?),
+            "--json" => a.json = true,
             "--limit" => {
                 a.limit = value("--limit", &mut it)?
                     .parse()
@@ -384,12 +388,46 @@ fn banned(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+/// Records a lift, but only one that actually happened.
+///
+/// Split out because the kernel map needs `CAP_BPF` and cannot be driven from a
+/// test, while the rule that matters here can be: **an address that was not
+/// blocked must leave no trace.** A row for a lift that did not happen is a
+/// negative label against a source nothing was ever alleged about, and R1 reads
+/// these rows as an operator saying the machine was wrong.
+///
+/// Never fatal. The kernel removal is the operator's actual intent and has
+/// already happened by the time this runs; failing the command afterwards would
+/// tell them the unban did not work when it did. Never silent either — this is
+/// the highest-quality label in the corpus and losing one quietly is how the
+/// precision measure rots.
+fn record_lift(store: Option<&Store>, ts: u32, ip: Ipv4Addr, removed: bool) {
+    if !removed {
+        return;
+    }
+    let Some(s) = store else {
+        return;
+    };
+    if let Err(e) = s.log_unban(ts, ip, "operator") {
+        eprintln!("WARNING: {ip} was unbanned but the lift was not recorded: {e}");
+    }
+}
+
 fn unban(args: &Args) -> Result<(), String> {
     let mut b = Blocklist::open(args.map.as_deref())?;
+    // Read-write here, unlike every other command in this tool: an unban is the
+    // one thing `tfps_ctl` does that the corpus needs to know about. Opened
+    // best-effort so a database that cannot be written still lets the operator
+    // lift a block — protection outranks bookkeeping.
+    let store = Store::open(&args.db)
+        .map_err(|e| eprintln!("WARNING: lifts will not be recorded: {e}"))
+        .ok();
+    let ts = now();
     if args.all {
         let all = b.entries();
         for (ip, _) in &all {
             b.remove(*ip)?;
+            record_lift(store.as_ref(), ts, *ip, true);
         }
         say!("unbanned {} sources", all.len());
         return Ok(());
@@ -401,11 +439,13 @@ fn unban(args: &Args) -> Result<(), String> {
         let ip: Ipv4Addr = raw.parse().map_err(|e| format!("{raw}: {e}"))?;
         // Saying "unbanned" for an address that was never there would be a small lie the
         // operator acts on: they would stop looking for the real block.
-        if b.remove(ip)? {
+        let removed = b.remove(ip)?;
+        if removed {
             say!("unbanned {ip}");
         } else {
             say!("{ip} was not blocked");
         }
+        record_lift(store.as_ref(), ts, ip, removed);
     }
     Ok(())
 }
@@ -533,7 +573,52 @@ fn countries(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+/// One exported label, as the wire sees it.
+///
+/// A struct rather than a hand-built string: this is a contract another
+/// repository parses, and hand-rolled escaping is how a detail containing a
+/// quote — an injection pattern, for instance — silently produces a line the
+/// consumer cannot read. `null` is emitted rather than the field being omitted,
+/// so a reader can tell "no unban" from "field missing".
+#[derive(serde::Serialize)]
+struct JsonLabel<'a> {
+    ip: &'a str,
+    rule: &'a str,
+    detail: &'a str,
+    first_seen: u32,
+    expires: Option<i64>,
+    unbanned_at: Option<u32>,
+    enforced: bool,
+    verdict: &'a str,
+}
+
+fn log_json(args: &Args) -> Result<(), String> {
+    let s = Store::open_readonly(&args.db)?;
+    for l in s.labels(args.limit)? {
+        let row = JsonLabel {
+            ip: &l.ip,
+            rule: &l.rule,
+            detail: &l.detail,
+            first_seen: l.first_seen,
+            expires: l.expires,
+            unbanned_at: l.unbanned_at,
+            enforced: l.enforced,
+            verdict: l.verdict,
+        };
+        // JSON Lines: one object per line, so a consumer can stream it and a
+        // truncated file still yields every complete record before the cut.
+        say!(
+            "{}",
+            serde_json::to_string(&row).map_err(|e| format!("serialising a label: {e}"))?
+        );
+    }
+    Ok(())
+}
+
 fn log(args: &Args) -> Result<(), String> {
+    if args.json {
+        return log_json(args);
+    }
     let s = Store::open_readonly(&args.db)?;
     let rows: Vec<BlockRow> = s.blocks(args.limit, args.ip.as_deref())?;
     if rows.is_empty() {
@@ -598,6 +683,68 @@ fn ago(secs: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- R1: the gold negative ----
+
+    fn ctl_db(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("tfps-ctl-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.join("tfps.db")
+    }
+
+    fn lifts(s: &Store) -> Vec<tfps::store::UnbanRow> {
+        s.unbans(100).unwrap()
+    }
+
+    #[test]
+    fn a_real_lift_is_recorded_as_an_operator_judgement() {
+        let path = ctl_db("lift");
+        let s = Store::open(&path).unwrap();
+        record_lift(Some(&s), 500, "198.51.100.1".parse().unwrap(), true);
+        let rows = lifts(&s);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ip, "198.51.100.1");
+        assert_eq!(
+            rows[0].actor, "operator",
+            "the actor must distinguish a human lift from a TTL lapsing"
+        );
+    }
+
+    // THE RULE. `unban` on an address that was never blocked prints "was not
+    // blocked" and must write nothing: a row here would be a negative label
+    // against a source nothing was ever alleged about, and R1 counts these as
+    // an operator saying the machine was wrong.
+    #[test]
+    fn lifting_an_address_that_was_not_blocked_records_nothing() {
+        let path = ctl_db("no-lift");
+        let s = Store::open(&path).unwrap();
+        record_lift(Some(&s), 500, "198.51.100.2".parse().unwrap(), false);
+        assert!(
+            lifts(&s).is_empty(),
+            "a lift that did not happen must leave no trace"
+        );
+    }
+
+    // Bookkeeping must never be able to stop the operator lifting a block, so a
+    // missing store is not an error here -- but it must also not panic, which is
+    // what an unwrap on the open would have done on a read-only filesystem.
+    #[test]
+    fn a_lift_without_a_database_still_completes() {
+        record_lift(None, 500, "198.51.100.3".parse().unwrap(), true);
+    }
+
+    // NEGATIVE CONTROL for the pair above: with a store present and `removed`
+    // true, exactly one row appears -- so "records nothing" is not passing
+    // because nothing is ever recorded.
+    #[test]
+    fn recording_is_reachable_so_the_silence_tests_are_not_vacuous() {
+        let path = ctl_db("reachable");
+        let s = Store::open(&path).unwrap();
+        record_lift(Some(&s), 1, "198.51.100.4".parse().unwrap(), true);
+        record_lift(Some(&s), 2, "198.51.100.5".parse().unwrap(), false);
+        assert_eq!(lifts(&s).len(), 1, "exactly the real lift, and only it");
+    }
 
     fn args(v: &[&str]) -> Result<Args, String> {
         parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>())

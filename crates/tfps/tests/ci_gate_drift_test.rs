@@ -161,3 +161,48 @@ fn superseded_runs_are_cancelled() {
         "the concurrency group must cancel superseded runs, not merely serialise them"
     );
 }
+
+// ---- Owed: I committed while clippy was failing ----
+//
+// The check ran, printed its failure, and the commit went ahead anyway because
+// the two were chained with `;` rather than `&&`. That is the same defect this
+// tree spent a commit removing from its write paths: a failure that stops
+// nothing. Locally the repair is discipline, but the gate can be weakened in
+// exactly the same way, and that CAN be asserted.
+
+/// A step marked `continue-on-error` reports failure and lets the job pass. The
+/// tick stays green and the gate has become decoration.
+#[test]
+fn no_gate_step_is_allowed_to_fail_without_failing_the_job() {
+    let w = workflow();
+    assert!(
+        !w.contains("continue-on-error: true"),
+        "a gate step marked continue-on-error still shows green when it fails; \
+         that is a check nobody is stopped by"
+    );
+}
+
+/// The shell equivalent, and the more common one: `cmd || true` runs the check,
+/// prints the failure, and exits 0. devstack-core's YAML lint does exactly this
+/// today, which is how an unformatted tree can sail through a green gate.
+#[test]
+fn no_gate_command_swallows_its_own_exit_code() {
+    let w = workflow();
+    for (i, line) in w.lines().enumerate() {
+        let l = line.trim();
+        if !l.starts_with("run:") && !l.starts_with("- run:") {
+            continue;
+        }
+        assert!(
+            !l.contains("|| true"),
+            "workflow line {} swallows its exit code: {l:?}",
+            i + 1
+        );
+        assert!(
+            !l.contains('|'),
+            "workflow line {} pipes a gate command: a pipe reports the LAST \
+             command's status, which is how a red check reads as green: {l:?}",
+            i + 1
+        );
+    }
+}

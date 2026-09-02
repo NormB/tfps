@@ -79,6 +79,40 @@ pub struct BlockRow {
     pub detail: String,
 }
 
+/// One exported label: a judged source, and what became of the judgement.
+///
+/// The shape sipnab reads. Field meanings are pinned in the R1 design so a
+/// consumer in another repository does not have to guess.
+pub struct LabelRow {
+    /// When this decision was reached, Unix seconds. Not the address's first
+    /// ever sighting — this event's own timestamp.
+    pub first_seen: u32,
+    /// The judged source.
+    pub ip: String,
+    /// The rule that fired, or the exemption source.
+    pub rule: String,
+    /// What the rule matched.
+    pub detail: String,
+    /// `blocked`, `would-block` or `exempt`, derived from how it was recorded.
+    pub verdict: &'static str,
+    /// Whether enforcement actually applied. False for every exemption.
+    pub enforced: bool,
+    /// Absolute lapse time; `Some(0)` is never, `None` is "no block, no TTL".
+    pub expires: Option<i64>,
+    /// When an operator lifted it, if one did.
+    pub unbanned_at: Option<u32>,
+}
+
+/// One lifted block — a human overruling the machine.
+pub struct UnbanRow {
+    /// When the lift happened, as a Unix timestamp.
+    pub ts: u32,
+    /// The address that was unblocked.
+    pub ip: String,
+    /// Who lifted it. Only `operator` counts as a human judgement.
+    pub actor: String,
+}
+
 /// How an operator narrows a source search.
 pub struct SourceFilter<'a> {
     /// Exactly this peer, when the operator named one.
@@ -470,6 +504,103 @@ impl Store {
             )
             .map(|_| ())
             .map_err(|e| format!("recording an unban for {ip}: {e}"))
+    }
+
+    /// The lifted blocks, newest first.
+    pub fn unbans(&self, limit: usize) -> Result<Vec<UnbanRow>, String> {
+        let mut st = self
+            .conn
+            .prepare("SELECT ts, ip, actor FROM unban_log ORDER BY ts DESC LIMIT ?1")
+            .map_err(|e| format!("reading unban_log: {e}"))?;
+        let rows = st
+            .query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |r| {
+                Ok(UnbanRow {
+                    ts: r.get(0)?,
+                    ip: r.get(1)?,
+                    actor: r.get(2)?,
+                })
+            })
+            .map_err(|e| format!("reading unban_log: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("iterating unban_log: {e}"))
+    }
+
+    /// Every label, newest first — the R1 export.
+    ///
+    /// Three tables, one stream. The verdict is derived from `enforced` rather
+    /// than stored: a column would be the same fact written twice and free to
+    /// disagree with the row it describes.
+    ///
+    /// The unban join is deliberately by address and not by row: `unban_log`
+    /// records that a source was lifted, not which of its blocks was meant, and
+    /// inventing a pairing would be a claim the data does not make.
+    pub fn labels(&self, limit: usize) -> Result<Vec<LabelRow>, String> {
+        let cap = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut out = Vec::new();
+
+        let mut st = self
+            .conn
+            .prepare(
+                "SELECT b.ts, b.ip, b.reason, b.detail, b.enforced, b.expires,
+                        (SELECT MAX(u.ts) FROM unban_log u
+                          WHERE u.ip = b.ip AND u.actor = 'operator' AND u.ts >= b.ts)
+                 FROM block_log b ORDER BY b.ts DESC LIMIT ?1",
+            )
+            .map_err(|e| format!("reading labels: {e}"))?;
+        let rows = st
+            .query_map(params![cap], |r| {
+                let enforced: i64 = r.get(4)?;
+                Ok(LabelRow {
+                    first_seen: r.get(0)?,
+                    ip: r.get(1)?,
+                    rule: r.get(2)?,
+                    detail: r.get(3)?,
+                    verdict: if enforced != 0 {
+                        "blocked"
+                    } else {
+                        "would-block"
+                    },
+                    enforced: enforced != 0,
+                    expires: r.get(5)?,
+                    unbanned_at: r.get(6)?,
+                })
+            })
+            .map_err(|e| format!("reading labels: {e}"))?;
+        for r in rows {
+            out.push(r.map_err(|e| format!("iterating labels: {e}"))?);
+        }
+
+        let mut st = self
+            .conn
+            .prepare(
+                "SELECT ts, ip, reason, detail, rule FROM exempt_log ORDER BY ts DESC LIMIT ?1",
+            )
+            .map_err(|e| format!("reading exemptions: {e}"))?;
+        let rows = st
+            .query_map(params![cap], |r| {
+                Ok(LabelRow {
+                    first_seen: r.get(0)?,
+                    ip: r.get(1)?,
+                    // The exemption SOURCE is the rule for an exempt row: which
+                    // list spared it is the evidence, and the signature that
+                    // fired is carried in `detail` alongside what it matched.
+                    rule: r.get(4)?,
+                    detail: format!("{}: {}", r.get::<_, String>(2)?, r.get::<_, String>(3)?),
+                    verdict: "exempt",
+                    enforced: false,
+                    expires: None,
+                    unbanned_at: None,
+                })
+            })
+            .map_err(|e| format!("reading exemptions: {e}"))?;
+        for r in rows {
+            out.push(r.map_err(|e| format!("iterating exemptions: {e}"))?);
+        }
+
+        // Newest first, matching every other reader in this tool.
+        out.sort_by_key(|l| std::cmp::Reverse(l.first_seen));
+        out.truncate(limit);
+        Ok(out)
     }
 
     /// Deletes old audit rows. Without this the file grows forever — which is what
@@ -1198,6 +1329,99 @@ mod tests {
             r.is_err(),
             "a lost label must be reported; silence here loses the corpus a row at a time"
         );
+    }
+
+    // ---- R1: the export, which another repository parses ----
+
+    #[test]
+    fn the_export_carries_all_three_verdicts() {
+        let path = fresh("export-all");
+        let s = Store::open(&path).unwrap();
+        s.log_decision(10, "198.51.100.1".parse().unwrap(), &dispo_block(), 60)
+            .unwrap();
+        s.log_decision(
+            20,
+            "198.51.100.2".parse().unwrap(),
+            &tfps_core::disposition::Disposition::WouldBlock {
+                kind: "injection",
+                detail: "'",
+            },
+            60,
+        )
+        .unwrap();
+        s.log_decision(
+            30,
+            "198.51.100.3".parse().unwrap(),
+            &tfps_core::disposition::Disposition::ExemptIgnoreIp {
+                kind: "scanner",
+                detail: "sipvicious",
+                rule: "10.0.0.0/8",
+            },
+            60,
+        )
+        .unwrap();
+        let v: Vec<&str> = s.labels(50).unwrap().iter().map(|l| l.verdict).collect();
+        assert_eq!(v, vec!["exempt", "would-block", "blocked"], "newest first");
+    }
+
+    // The verdict is derived, so it cannot disagree with the row it describes.
+    #[test]
+    fn the_verdict_follows_enforcement_rather_than_a_stored_column() {
+        let path = fresh("export-derive");
+        let s = Store::open(&path).unwrap();
+        s.log_decision(10, "198.51.100.1".parse().unwrap(), &dispo_block(), 60)
+            .unwrap();
+        let l = &s.labels(50).unwrap()[0];
+        assert!(l.enforced);
+        assert_eq!(l.verdict, "blocked");
+        assert_eq!(l.expires, Some(70));
+    }
+
+    // An operator lift attaches to the block it followed. A lift recorded
+    // BEFORE a block must not attach to it: that would read as a human
+    // overruling a decision that had not been made yet.
+    #[test]
+    fn an_operator_lift_attaches_only_to_a_block_that_preceded_it() {
+        let path = fresh("export-unban");
+        let s = Store::open(&path).unwrap();
+        s.log_decision(100, "198.51.100.1".parse().unwrap(), &dispo_block(), 60)
+            .unwrap();
+        s.log_unban(50, "198.51.100.1".parse().unwrap(), "operator")
+            .unwrap();
+        assert_eq!(
+            s.labels(50).unwrap()[0].unbanned_at,
+            None,
+            "a lift before the block must not be read as overruling it"
+        );
+        s.log_unban(150, "198.51.100.1".parse().unwrap(), "operator")
+            .unwrap();
+        assert_eq!(s.labels(50).unwrap()[0].unbanned_at, Some(150));
+    }
+
+    // Only a human counts. A TTL lapse is not somebody saying the machine was
+    // wrong, and counting it would inflate the false-positive rate R1 measures.
+    #[test]
+    fn a_non_operator_lift_is_not_a_negative_label() {
+        let path = fresh("export-ttl");
+        let s = Store::open(&path).unwrap();
+        s.log_decision(100, "198.51.100.1".parse().unwrap(), &dispo_block(), 60)
+            .unwrap();
+        s.log_unban(150, "198.51.100.1".parse().unwrap(), "ttl")
+            .unwrap();
+        assert_eq!(
+            s.labels(50).unwrap()[0].unbanned_at,
+            None,
+            "only an operator lift is a human judgement"
+        );
+    }
+
+    // NEGATIVE CONTROL: an empty database exports nothing and does not error.
+    // "No labels yet" and "the export is broken" must never be one value.
+    #[test]
+    fn an_empty_database_exports_no_labels_without_failing() {
+        let path = fresh("export-empty");
+        let s = Store::open(&path).unwrap();
+        assert!(s.labels(50).expect("empty is an answer").is_empty());
     }
 
     #[test]
