@@ -84,9 +84,23 @@ the case worth catching.
 
 ### 5.1 The `--no-enforce` fix (own commit, lands first)
 
-A fourth arm on the chain in `crates/tfps/src/main.rs`: reason present, no
-exemption matched, no enforcer → emit `WOULD BLOCK peer=… reason=… detail=…`
-and write a `block_log` row with `enforced = 0`.
+**Landed 2026-09-02.** Implemented differently from this paragraph's original
+plan, and the difference is the point.
+
+A fourth `else if` would have fixed this instance and left the class. The defect
+*was* a missing arm, so the repair is a construction in which an arm cannot go
+missing: `tfps_core::disposition::Disposition`, a total match the compiler
+checks. Adding a state without handling it now stops the build.
+
+The decision is a pure function taking enforcement as an argument rather than
+reading it from an `Option<Enforcer>`. That was also the only way to test it:
+`main.rs` had no tests at all and the chain lived inside a ~660-line `fn main()`.
+`crates/tfps/src/lib.rs` already says decision logic belongs in `tfps-core`, so
+that is where it went.
+
+Twelve tests. Three went red against the bug reproduced on purpose; five pin
+what must not move; four pin the invariants that make `main.rs`'s defensive
+`ALARM` arm provably dead code. All mutations caught.
 
 This is a live defect independent of R1. Today the tool reports the peers it
 *declined* to ban and stays silent about the ones it *would* have — backwards,

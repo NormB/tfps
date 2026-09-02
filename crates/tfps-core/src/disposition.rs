@@ -220,6 +220,86 @@ mod tests {
         assert!(Disposition::Ignore.kind().is_none());
     }
 
+    // ---- Owed: the invariants that make main.rs's defensive arm dead code. ----
+    //
+    // `main.rs` matches `Block` and unwraps the enforcer, with an ALARM branch
+    // if it is absent. That branch cannot be driven from a test because it is
+    // unreachable by construction -- so the construction is what gets tested.
+    // Without these, the ALARM is an untested claim about a function nobody
+    // pinned.
+
+    #[test]
+    fn block_is_returned_only_while_enforcing() {
+        // Exhaustive over the inputs that can reach a verdict: no combination
+        // with enforcing=false may yield Block.
+        for reason in [INJECTION, Some(("scanner", "sipvicious")), None] {
+            for rule in [None, Some("10.0.0.0/8")] {
+                for known in [true, false] {
+                    let d = disposition(reason, rule, known, false);
+                    assert!(
+                        !matches!(d, Disposition::Block { .. }),
+                        "Block while not enforcing: reason={reason:?} rule={rule:?} known={known}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn would_block_is_returned_only_while_not_enforcing() {
+        for reason in [INJECTION, Some(("scanner", "sipvicious")), None] {
+            for rule in [None, Some("10.0.0.0/8")] {
+                for known in [true, false] {
+                    let d = disposition(reason, rule, known, true);
+                    assert!(
+                        !matches!(d, Disposition::WouldBlock { .. }),
+                        "WouldBlock while enforcing: reason={reason:?} rule={rule:?} known={known}"
+                    );
+                }
+            }
+        }
+    }
+
+    // The pair above is only meaningful if both states are actually reachable;
+    // two vacuous truths would also pass. This is that positive control.
+    #[test]
+    fn both_enforcement_outcomes_are_reachable() {
+        assert!(matches!(
+            disposition(INJECTION, None, false, true),
+            Disposition::Block { .. }
+        ));
+        assert!(matches!(
+            disposition(INJECTION, None, false, false),
+            Disposition::WouldBlock { .. }
+        ));
+    }
+
+    // Enforcement changes only the verdict arm. If it ever alters an exemption
+    // or a silence, the "judging is independent of acting" property is gone and
+    // the corpus would depend on whether protection happened to be on.
+    #[test]
+    fn enforcement_changes_only_the_verdict_arm() {
+        for reason in [INJECTION, None] {
+            for rule in [None, Some("10.0.0.0/8")] {
+                for known in [true, false] {
+                    let on = disposition(reason, rule, known, true);
+                    let off = disposition(reason, rule, known, false);
+                    let verdict_arm = matches!(
+                        on,
+                        Disposition::Block { .. } | Disposition::WouldBlock { .. }
+                    );
+                    if !verdict_arm {
+                        assert_eq!(
+                            on, off,
+                            "enforcement changed a non-verdict outcome: \
+                             reason={reason:?} rule={rule:?} known={known}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // The verdict names used by the exporter are part of the cross-repository
     // contract; sipnab matches on these strings.
     #[test]
