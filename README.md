@@ -412,10 +412,11 @@ The counterpart to `fail2ban-client`. With no labels, **how often you unban is t
 precision measure this system has**, so that act is one command.
 
 ```
-tfps_ctl status                       what is running, what is blocked, how fresh the state is
+tfps_ctl status [--json]              what is running, what is blocked, how fresh the state is
 tfps_ctl stats                        every counter: kernel drops, traffic mix, calibration
-tfps_ctl banned [--why]               condemned sources, with time left and the reason
-tfps_ctl dropped [--limit N] [--ip IP] what blocked sources kept sending, and why they were blocked
+tfps_ctl banned [--why] [--json]      condemned sources, with time left and the reason
+tfps_ctl dropped [--limit N] [--ip IP] [--json]
+                                      what blocked sources kept sending, and why they were blocked
 tfps_ctl unban <ip>... | --all        lift a block — takes effect on the next packet
 tfps_ctl ban <ip> [--ttl N]           condemn by hand (default 3600s, 0 = no expiry)
 tfps_ctl sources [--peer --country]   learned sources and the countries they call
@@ -423,6 +424,21 @@ tfps_ctl source <peer>                everything known about one source
 tfps_ctl peers                        sources by country breadth, when last heard
 tfps_ctl log [--limit N] [--ip IP]    the block audit log, newest first
 tfps_ctl log --json [--limit N]       every label as JSON Lines — all of them unless you say --limit
+```
+
+**For a program, add `--json`.** Every surface another tool needs speaks one dialect:
+JSON Lines where there are several records, `snake_case` keys, timestamps as RFC 3339 UTC
+strings, and every field always present — `null` when unknown, so a reader can tell "no
+value" from "field missing". `status --json` is one object; `banned --json`, `dropped
+--json` and `log --json` are one line per record, and `log --json` is every label unless
+you say `--limit`. The shapes are pinned by golden fixtures under
+`crates/tfps/tests/fixtures/` (`tfps-status-golden.json`, `tfps-banned-golden.jsonl`,
+`tfps-dropped-golden.jsonl`, `tfps-labels-golden.jsonl`), which sipnab holds byte for
+byte: a change here that the fixture does not carry fails the build on both sides.
+
+```console
+# tfps_ctl status --json
+{"enforcement":"active","mode":"native","interface":"eth0","blocked_now":3,"db":"/var/lib/tfps/tfps.db","version":"0.1.0"}
 ```
 
 ```console

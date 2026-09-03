@@ -86,6 +86,9 @@ pub struct Enforcer {
     /// Human-readable description of where enforcement is happening — it goes into the
     /// report, because the operator needs to know who is doing the blocking.
     pub mode: String,
+    /// How our own program attached, for a program to read: `("native" | "skb", iface)`.
+    /// `None` under a shared map, whose attachment is another product's business.
+    pub attached: Option<(&'static str, String)>,
     /// What the program drops, as it reports it. `None` under a shared map — another
     /// product's program has no ring buffer of ours — or when the object predates it.
     drops: Option<DropSensor>,
@@ -160,6 +163,7 @@ impl Enforcer {
             .map_err(|e| format!("map is not a hash<u32,u64>: {e}"))?;
         Ok(Self {
             mode: format!("shared map {}", path.display()),
+            attached: None,
             blocked_by_us: 0,
             backend: Backend::Shared { map },
             drops: None,
@@ -203,10 +207,10 @@ impl Enforcer {
         // Native first, generic as a fallback. Generic runs after `sk_buff` allocation and
         // costs more per packet — but it is still **before** the libpcap tap, which is what
         // matters for a clean sngrep.
-        let mode = match prog.attach(iface, XdpMode::Driver) {
-            Ok(_) => "native (DRV)",
+        let (mode, short) = match prog.attach(iface, XdpMode::Driver) {
+            Ok(_) => ("native (DRV)", "native"),
             Err(native_err) => match prog.attach(iface, XdpMode::Skb) {
-                Ok(_) => "generic (SKB)",
+                Ok(_) => ("generic (SKB)", "skb"),
                 Err(skb_err) => {
                     return Err(format!(
                         "could not attach XDP on {iface}: native failed ({native_err}); \
@@ -234,6 +238,7 @@ impl Enforcer {
 
         let mut me = Self {
             mode: format!("own program, XDP {mode} on {iface}"),
+            attached: Some((short, iface.to_string())),
             blocked_by_us: 0,
             backend: Backend::Own { bpf: Box::new(bpf) },
             drops,

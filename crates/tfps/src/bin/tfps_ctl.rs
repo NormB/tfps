@@ -13,12 +13,13 @@
 //!   shown is therefore a snapshot, and `status` says how old it is rather than letting
 //!   somebody draw conclusions from stale rows.
 
-use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use tfps::contract::Label;
+use tfps::ctl::{attribute, latest_reasons, status_of, to_banned, to_dropped, Attribution};
 use tfps::drops::proto_name;
 use tfps::say;
 use tfps::store::{BlockRow, SourceFilter, Store};
@@ -30,10 +31,11 @@ fn usage() -> String {
 
 USAGE: tfps_ctl <command> [options]
 
-  status                       what is running, what is blocked, how fresh the state is
+  status [--json]              what is running, what is blocked, how fresh the state is
   stats                        every counter: kernel drops, traffic mix, what got blocked
-  banned [--why]               list condemned sources, with time left
-  dropped [--limit N] [--ip IP] what blocked sources kept sending, and why they were blocked
+  banned [--why] [--json]      list condemned sources, with time left
+  dropped [--limit N] [--ip IP] [--json]
+                               what blocked sources kept sending, and why they were blocked
   unban <ip>... | --all        lift a block. The precision measure of this product
   ban <ip> [--ttl N]           condemn a source by hand (default ttl: 3600s, 0 = forever)
   sources [filters]            list learned sources and the countries they call
@@ -52,6 +54,7 @@ SOURCE FILTERS:
 GLOBAL:
   --db PATH                    database (default: {db})
   --map PATH                   an explicitly pinned block map
+  --json                       machine output: JSON Lines, every field present, null when unknown
   -h, --help                   this help
 
 Reading blocks needs CAP_BPF (run as root). Reading learned state only needs the database.
@@ -192,7 +195,15 @@ fn main() -> ExitCode {
 
 // ---------------------------------------------------------------- commands
 
+/// One JSON object per line, or the reason it could not be made.
+fn json_line<T: serde::Serialize>(v: &T) -> Result<String, String> {
+    serde_json::to_string(v).map_err(|e| format!("serialising: {e}"))
+}
+
 fn status(args: &Args) -> Result<(), String> {
+    if args.json {
+        return status_json(args);
+    }
     say!("database          : {}", args.db.display());
     match Store::open_readonly(&args.db).and_then(|s| s.totals()) {
         Ok((pairs, peers, newest)) => {
@@ -221,6 +232,33 @@ fn status(args: &Args) -> Result<(), String> {
             say!("                    (learned state above is still readable)");
         }
     }
+    Ok(())
+}
+
+/// `status --json`: the same facts, for a program.
+///
+/// `enforcement` is `inactive` whenever no block map could be opened, and the
+/// reason -- no daemon, or no `CAP_BPF` -- goes to stderr, because the
+/// contract has two values and "could not look" must not read as a third.
+fn status_json(args: &Args) -> Result<(), String> {
+    let store = Store::open_readonly(&args.db).ok();
+    let blocked = match Blocklist::open(args.map.as_deref()) {
+        Ok(b) => Some(b.entries().len()),
+        Err(e) => {
+            eprintln!("enforcement unreachable: {e}");
+            None
+        }
+    };
+    let mode = store.as_ref().and_then(|s| s.meta_get("xdp_mode"));
+    let iface = store.as_ref().and_then(|s| s.meta_get("iface"));
+    let st = status_of(
+        blocked,
+        mode.as_deref(),
+        iface.as_deref(),
+        &args.db,
+        env!("CARGO_PKG_VERSION"),
+    );
+    say!("{}", json_line(&st)?);
     Ok(())
 }
 
@@ -375,56 +413,14 @@ fn stats(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
-/// Where a block's explanation came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Attribution {
-    /// The audit log has a row: the perimeter, or an operator's `ban`.
-    Perimeter,
-    /// Only the APIBAN feed lists it.
-    Feed,
-    /// Nothing here explains it.
-    Unknown,
-}
-
-/// Why an address is blocked, as far as this database knows.
-///
-/// One rule for `banned` and `dropped`, because two copies would drift and the same
-/// address would be a scanner in one listing and unattributed in the other. The audit
-/// log wins over the feed: a scanner is often on both — APIBAN's honeypots catch the
-/// same tools — and the reason WE condemned it is the perimeter one.
-fn attribute(
-    audit: &HashMap<String, (String, String)>,
-    apiban: &HashSet<String>,
-    ip: &str,
-) -> (Attribution, String) {
-    if let Some((reason, detail)) = audit.get(ip) {
-        (Attribution::Perimeter, format!("{reason} ({detail})"))
-    } else if apiban.contains(ip) {
-        (Attribution::Feed, "apiban (feed)".to_string())
-    } else {
-        (Attribution::Unknown, "not in this audit log".to_string())
-    }
-}
-
-/// ip -> (reason, detail): the most recent block of each address in the audit log.
-fn latest_reasons(store: Option<&Store>) -> HashMap<String, (String, String)> {
-    let mut audit = HashMap::new();
-    if let Some(s) = store {
-        // Rows come newest-first, so the first seen per address is the latest.
-        if let Ok(rows) = s.blocks(1_000_000, None) {
-            for r in rows {
-                audit.entry(r.ip).or_insert((r.reason, r.detail));
-            }
-        }
-    }
-    audit
-}
-
 fn banned(args: &Args) -> Result<(), String> {
     let b = Blocklist::open(args.map.as_deref())?;
     let entries = b.entries();
     if entries.is_empty() {
-        say!("nothing is blocked");
+        // An empty stream is the JSON answer; the sentence is for a person.
+        if !args.json {
+            say!("nothing is blocked");
+        }
         return Ok(());
     }
     // Load both sets once, then attribute each block through the one shared rule.
@@ -436,6 +432,17 @@ fn banned(args: &Args) -> Result<(), String> {
     let audit = latest_reasons(store.as_ref());
 
     let now_ns = monotonic_ns();
+    if args.json {
+        let now_wall = now();
+        for (ip, until) in &entries {
+            let why = attribute(&audit, &apiban, &ip.to_string());
+            say!(
+                "{}",
+                json_line(&to_banned(*ip, *until, now_ns, now_wall, &why))?
+            );
+        }
+        return Ok(());
+    }
     let (mut n_perimeter, mut n_apiban, mut n_unknown) = (0usize, 0usize, 0usize);
     say!("{:<16} {:>10}  REASON", "SOURCE", "EXPIRES IN");
     for (ip, until) in &entries {
@@ -445,14 +452,14 @@ fn banned(args: &Args) -> Result<(), String> {
             ago(((*until).saturating_sub(now_ns) / 1_000_000_000) as u32)
         };
         let ip_s = ip.to_string();
-        let (origin, why) = attribute(&audit, &apiban, &ip_s);
-        match origin {
-            Attribution::Perimeter => n_perimeter += 1,
+        let why = attribute(&audit, &apiban, &ip_s);
+        match why {
+            Attribution::Perimeter { .. } => n_perimeter += 1,
             Attribution::Feed => n_apiban += 1,
             Attribution::Unknown => n_unknown += 1,
         }
         if args.why {
-            say!("{ip_s:<16} {left:>10}  {why}");
+            say!("{ip_s:<16} {left:>10}  {}", why.why());
         } else {
             say!("{ip_s:<16} {left:>10}");
         }
@@ -478,14 +485,23 @@ fn dropped(args: &Args) -> Result<(), String> {
     let s = Store::open_readonly(&args.db)?;
     let rows = s.dropped(args.rows(), args.ip.as_deref())?;
     if rows.is_empty() {
-        say!(
-            "no dropped traffic recorded — the daemon writes this at checkpoint (every 5 \
-             minutes), and only its own XDP program reports drops"
-        );
+        if !args.json {
+            say!(
+                "no dropped traffic recorded — the daemon writes this at checkpoint (every 5 \
+                 minutes), and only its own XDP program reports drops"
+            );
+        }
         return Ok(());
     }
     let apiban = s.apiban_all().unwrap_or_default();
     let audit = latest_reasons(Some(&s));
+    if args.json {
+        for r in &rows {
+            let why = attribute(&audit, &apiban, &r.ip);
+            say!("{}", json_line(&to_dropped(r, &why))?);
+        }
+        return Ok(());
+    }
     let now = now();
     say!(
         "{:<16} {:>9} {:>7} {:>7}  {:<24} LAST REQUEST",
@@ -496,7 +512,7 @@ fn dropped(args: &Args) -> Result<(), String> {
         "WHY BLOCKED"
     );
     for r in &rows {
-        let (_, why) = attribute(&audit, &apiban, &r.ip);
+        let why = attribute(&audit, &apiban, &r.ip).why();
         say!(
             "{:<16} {:>9} {:>7} {:>7}  {:<24} {}:{} {}",
             r.ip,
@@ -702,45 +718,29 @@ fn countries(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
-/// One exported label, as the wire sees it.
-///
-/// A struct rather than a hand-built string: this is a contract another
-/// repository parses, and hand-rolled escaping is how a detail containing a
-/// quote — an injection pattern, for instance — silently produces a line the
-/// consumer cannot read. `null` is emitted rather than the field being omitted,
-/// so a reader can tell "no unban" from "field missing".
-#[derive(serde::Serialize)]
-struct JsonLabel<'a> {
-    ip: &'a str,
-    rule: &'a str,
-    detail: &'a str,
-    first_seen: u32,
-    expires: Option<i64>,
-    unbanned_at: Option<u32>,
-    enforced: bool,
-    verdict: &'a str,
-}
-
 /// Every label the export emits, one JSON object per line, in order.
 ///
 /// Built as lines rather than printed directly so a test can count them:
 /// the export once shared the table's default of fifty and silently cut a
 /// real corpus short, and nothing here could have noticed.
 fn label_lines(s: &Store, args: &Args) -> Result<Vec<String>, String> {
+    // Through the contract struct rather than a hand-built string: this is a
+    // shape another repository parses, and hand-rolled escaping is how a
+    // detail containing a quote -- an injection pattern -- silently produces
+    // a line the consumer cannot read.
     s.labels(args.export_rows())?
-        .iter()
+        .into_iter()
         .map(|l| {
-            let row = JsonLabel {
-                ip: &l.ip,
-                rule: &l.rule,
-                detail: &l.detail,
+            json_line(&Label {
+                ip: l.ip,
+                rule: l.rule,
+                detail: l.detail,
                 first_seen: l.first_seen,
                 expires: l.expires,
                 unbanned_at: l.unbanned_at,
                 enforced: l.enforced,
-                verdict: l.verdict,
-            };
-            serde_json::to_string(&row).map_err(|e| format!("serialising a label: {e}"))
+                verdict: l.verdict.to_string(),
+            })
         })
         .collect()
 }
@@ -970,55 +970,6 @@ mod tests {
         // operator did not ask for.
         assert!(args(&["sources", "--limit"]).is_err());
         assert!(args(&["banned", "--bogus"]).is_err());
-    }
-
-    // ---- R2: one attribution rule, shared by `banned` and `dropped` ----
-    //
-    // `banned` already decided how a blocked address is explained: the audit log
-    // wins over the feed, and an address in neither says so. `dropped` needs the
-    // same answer for the same address, and two copies of that rule would drift
-    // — one command would call a source a scanner and the other would call it
-    // unattributed. So it is one function, and it is pinned here.
-
-    fn audit_of(entries: &[(&str, &str, &str)]) -> HashMap<String, (String, String)> {
-        entries
-            .iter()
-            .map(|(ip, r, d)| (ip.to_string(), (r.to_string(), d.to_string())))
-            .collect()
-    }
-
-    #[test]
-    fn the_audit_log_outranks_the_feed() {
-        // A scanner is often on both: APIBAN's honeypots catch the same tools. The
-        // reason WE condemned it is the perimeter one, not the list it also sits on.
-        let audit = audit_of(&[("198.51.100.1", "scanner", "sipvicious")]);
-        let feed = HashSet::from(["198.51.100.1".to_string()]);
-        assert_eq!(
-            attribute(&audit, &feed, "198.51.100.1"),
-            (Attribution::Perimeter, "scanner (sipvicious)".to_string())
-        );
-    }
-
-    #[test]
-    fn the_feed_is_named_when_the_audit_log_has_nothing() {
-        let audit = audit_of(&[]);
-        let feed = HashSet::from(["198.51.100.2".to_string()]);
-        assert_eq!(
-            attribute(&audit, &feed, "198.51.100.2"),
-            (Attribution::Feed, "apiban (feed)".to_string())
-        );
-    }
-
-    #[test]
-    fn an_unattributed_source_says_so() {
-        // A block placed by hand, or by a daemon whose audit log is gone: the
-        // operator must be told nothing explains it, not handed a guess.
-        let audit = audit_of(&[("198.51.100.1", "scanner", "sipvicious")]);
-        let feed = HashSet::new();
-        assert_eq!(
-            attribute(&audit, &feed, "198.51.100.9"),
-            (Attribution::Unknown, "not in this audit log".to_string())
-        );
     }
 
     #[test]

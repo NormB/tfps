@@ -541,6 +541,17 @@ fn main() -> ExitCode {
             }
         }
     };
+    // How enforcement attached, for `tfps_ctl status --json` in another process.
+    // Written every start, and written EMPTY when there is nothing to say, so a
+    // value left by a previous run never describes this one.
+    if let Some(s) = db.as_ref() {
+        let (mode, iface) = enforcer
+            .as_ref()
+            .and_then(|e| e.attached.clone())
+            .unwrap_or_default();
+        s.meta_set("xdp_mode", mode);
+        s.meta_set("iface", &iface);
+    }
     say!(
         "  perimeter         : {ua_int} user-agents (+{ua_ext} from file), \
          {inj_int} injection patterns (+{inj_ext}), {scan_int} scanner ids (+{scan_ext})"

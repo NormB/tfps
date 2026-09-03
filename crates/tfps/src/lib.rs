@@ -9,6 +9,8 @@
 
 pub mod apiban;
 pub mod config;
+pub mod contract;
+pub mod ctl;
 pub mod drops;
 pub mod hep;
 pub mod store;
