@@ -13,11 +13,13 @@
 //!   shown is therefore a snapshot, and `status` says how old it is rather than letting
 //!   somebody draw conclusions from stale rows.
 
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use tfps::drops::proto_name;
 use tfps::say;
 use tfps::store::{BlockRow, SourceFilter, Store};
 use tfps::xdp::{monotonic_ns, Blocklist};
@@ -31,6 +33,7 @@ USAGE: tfps_ctl <command> [options]
   status                       what is running, what is blocked, how fresh the state is
   stats                        every counter: kernel drops, traffic mix, what got blocked
   banned [--why]               list condemned sources, with time left
+  dropped [--limit N] [--ip IP] what blocked sources kept sending, and why they were blocked
   unban <ip>... | --all        lift a block. The precision measure of this product
   ban <ip> [--ttl N]           condemn a source by hand (default ttl: 3600s, 0 = forever)
   sources [filters]            list learned sources and the countries they call
@@ -146,6 +149,7 @@ fn main() -> ExitCode {
         "status" => status(&args),
         "stats" => stats(&args),
         "banned" => banned(&args),
+        "dropped" => dropped(&args),
         "unban" => unban(&args),
         "ban" => ban(&args),
         "sources" => sources(&args),
@@ -220,6 +224,18 @@ fn stats(args: &Args) -> Result<(), String> {
                 c.dropped
             );
             say!("  blocks expired    : {}", c.expired);
+            // The sample the daemon saw of those drops. A non-zero `lost` means the
+            // ring buffer overflowed and the sample is thinner than the policy says.
+            say!(
+                "  drops reported    : {} events to userspace, {} lost{}",
+                c.reported,
+                c.lost,
+                if c.lost > 0 {
+                    " — the daemon is not draining fast enough"
+                } else {
+                    ""
+                }
+            );
         }
         Err(e) => say!("KERNEL  (live)\n  unavailable — {e}"),
     }
@@ -320,7 +336,67 @@ fn stats(args: &Args) -> Result<(), String> {
         let detail: Vec<String> = rows.iter().map(|(r, n)| format!("{r}:{n}")).collect();
         say!("  {label:<16} {total:>10}  {}", detail.join(" "));
     }
+
+    // What the blocked sources did next. Five here; `dropped` has the rest.
+    let dropped = s.dropped(5, None)?;
+    if !dropped.is_empty() {
+        say!("\nSTILL SENDING  (blocked sources seen dropping, as of the last checkpoint)");
+        for r in &dropped {
+            say!(
+                "  {:<16} {:>10}  {} ago  {}",
+                r.ip,
+                r.drops,
+                ago(now.saturating_sub(r.last_ts)),
+                r.last_line
+            );
+        }
+    }
     Ok(())
+}
+
+/// Where a block's explanation came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Attribution {
+    /// The audit log has a row: the perimeter, or an operator's `ban`.
+    Perimeter,
+    /// Only the APIBAN feed lists it.
+    Feed,
+    /// Nothing here explains it.
+    Unknown,
+}
+
+/// Why an address is blocked, as far as this database knows.
+///
+/// One rule for `banned` and `dropped`, because two copies would drift and the same
+/// address would be a scanner in one listing and unattributed in the other. The audit
+/// log wins over the feed: a scanner is often on both — APIBAN's honeypots catch the
+/// same tools — and the reason WE condemned it is the perimeter one.
+fn attribute(
+    audit: &HashMap<String, (String, String)>,
+    apiban: &HashSet<String>,
+    ip: &str,
+) -> (Attribution, String) {
+    if let Some((reason, detail)) = audit.get(ip) {
+        (Attribution::Perimeter, format!("{reason} ({detail})"))
+    } else if apiban.contains(ip) {
+        (Attribution::Feed, "apiban (feed)".to_string())
+    } else {
+        (Attribution::Unknown, "not in this audit log".to_string())
+    }
+}
+
+/// ip -> (reason, detail): the most recent block of each address in the audit log.
+fn latest_reasons(store: Option<&Store>) -> HashMap<String, (String, String)> {
+    let mut audit = HashMap::new();
+    if let Some(s) = store {
+        // Rows come newest-first, so the first seen per address is the latest.
+        if let Ok(rows) = s.blocks(1_000_000, None) {
+            for r in rows {
+                audit.entry(r.ip).or_insert((r.reason, r.detail));
+            }
+        }
+    }
+    audit
 }
 
 fn banned(args: &Args) -> Result<(), String> {
@@ -330,24 +406,13 @@ fn banned(args: &Args) -> Result<(), String> {
         say!("nothing is blocked");
         return Ok(());
     }
-    // Attribute each block once, block_log winning over the APIBAN feed — a scanner is
-    // often on both (APIBAN's honeypots catch the same tools), and the *reason* we
-    // condemned it is the perimeter one, not the feed. Load both sets once.
+    // Load both sets once, then attribute each block through the one shared rule.
     let store = Store::open_readonly(&args.db).ok();
     let apiban = store
         .as_ref()
         .and_then(|s| s.apiban_all().ok())
         .unwrap_or_default();
-    // ip -> (reason, detail), most recent block per ip (rows come newest-first).
-    let mut audit: std::collections::HashMap<String, (String, String)> =
-        std::collections::HashMap::new();
-    if let Some(s) = store.as_ref() {
-        if let Ok(rows) = s.blocks(1_000_000, None) {
-            for r in rows {
-                audit.entry(r.ip).or_insert((r.reason, r.detail));
-            }
-        }
-    }
+    let audit = latest_reasons(store.as_ref());
 
     let now_ns = monotonic_ns();
     let (mut n_perimeter, mut n_apiban, mut n_unknown) = (0usize, 0usize, 0usize);
@@ -359,17 +424,12 @@ fn banned(args: &Args) -> Result<(), String> {
             ago(((*until).saturating_sub(now_ns) / 1_000_000_000) as u32)
         };
         let ip_s = ip.to_string();
-        // block_log reason wins; then the feed; then unknown.
-        let why = if let Some((reason, detail)) = audit.get(&ip_s) {
-            n_perimeter += 1;
-            format!("{reason} ({detail})")
-        } else if apiban.contains(&ip_s) {
-            n_apiban += 1;
-            "apiban (feed)".to_string()
-        } else {
-            n_unknown += 1;
-            "not in this audit log".to_string()
-        };
+        let (origin, why) = attribute(&audit, &apiban, &ip_s);
+        match origin {
+            Attribution::Perimeter => n_perimeter += 1,
+            Attribution::Feed => n_apiban += 1,
+            Attribution::Unknown => n_unknown += 1,
+        }
         if args.why {
             say!("{ip_s:<16} {left:>10}  {why}");
         } else {
@@ -384,6 +444,54 @@ fn banned(args: &Args) -> Result<(), String> {
         } else {
             String::new()
         }
+    );
+    Ok(())
+}
+
+/// What blocked sources kept sending, from the table the daemon flushes at checkpoint.
+///
+/// The counts are the kernel's and exact; the request line is from the latest sampled
+/// event. The "why" is the same attribution `banned` gives, so the two commands never
+/// disagree about an address.
+fn dropped(args: &Args) -> Result<(), String> {
+    let s = Store::open_readonly(&args.db)?;
+    let rows = s.dropped(args.limit, args.ip.as_deref())?;
+    if rows.is_empty() {
+        say!(
+            "no dropped traffic recorded — the daemon writes this at checkpoint (every 5 \
+             minutes), and only its own XDP program reports drops"
+        );
+        return Ok(());
+    }
+    let apiban = s.apiban_all().unwrap_or_default();
+    let audit = latest_reasons(Some(&s));
+    let now = now();
+    say!(
+        "{:<16} {:>9} {:>7} {:>7}  {:<24} LAST REQUEST",
+        "SOURCE",
+        "DROPPED",
+        "EVENTS",
+        "LAST",
+        "WHY BLOCKED"
+    );
+    for r in &rows {
+        let (_, why) = attribute(&audit, &apiban, &r.ip);
+        say!(
+            "{:<16} {:>9} {:>7} {:>7}  {:<24} {}:{} {}",
+            r.ip,
+            r.drops,
+            r.events,
+            ago(now.saturating_sub(r.last_ts)),
+            why,
+            proto_name(r.last_proto),
+            r.last_port,
+            r.last_line
+        );
+    }
+    say!(
+        "\n{} sources. DROPPED is the kernel's exact count; EVENTS is the sample it reported \
+         (the first few drops per source per second).",
+        rows.len()
     );
     Ok(())
 }
@@ -780,6 +888,55 @@ mod tests {
         // operator did not ask for.
         assert!(args(&["sources", "--limit"]).is_err());
         assert!(args(&["banned", "--bogus"]).is_err());
+    }
+
+    // ---- R2: one attribution rule, shared by `banned` and `dropped` ----
+    //
+    // `banned` already decided how a blocked address is explained: the audit log
+    // wins over the feed, and an address in neither says so. `dropped` needs the
+    // same answer for the same address, and two copies of that rule would drift
+    // — one command would call a source a scanner and the other would call it
+    // unattributed. So it is one function, and it is pinned here.
+
+    fn audit_of(entries: &[(&str, &str, &str)]) -> HashMap<String, (String, String)> {
+        entries
+            .iter()
+            .map(|(ip, r, d)| (ip.to_string(), (r.to_string(), d.to_string())))
+            .collect()
+    }
+
+    #[test]
+    fn the_audit_log_outranks_the_feed() {
+        // A scanner is often on both: APIBAN's honeypots catch the same tools. The
+        // reason WE condemned it is the perimeter one, not the list it also sits on.
+        let audit = audit_of(&[("198.51.100.1", "scanner", "sipvicious")]);
+        let feed = HashSet::from(["198.51.100.1".to_string()]);
+        assert_eq!(
+            attribute(&audit, &feed, "198.51.100.1"),
+            (Attribution::Perimeter, "scanner (sipvicious)".to_string())
+        );
+    }
+
+    #[test]
+    fn the_feed_is_named_when_the_audit_log_has_nothing() {
+        let audit = audit_of(&[]);
+        let feed = HashSet::from(["198.51.100.2".to_string()]);
+        assert_eq!(
+            attribute(&audit, &feed, "198.51.100.2"),
+            (Attribution::Feed, "apiban (feed)".to_string())
+        );
+    }
+
+    #[test]
+    fn an_unattributed_source_says_so() {
+        // A block placed by hand, or by a daemon whose audit log is gone: the
+        // operator must be told nothing explains it, not handed a guess.
+        let audit = audit_of(&[("198.51.100.1", "scanner", "sipvicious")]);
+        let feed = HashSet::new();
+        assert_eq!(
+            attribute(&audit, &feed, "198.51.100.9"),
+            (Attribution::Unknown, "not in this audit log".to_string())
+        );
     }
 
     #[test]

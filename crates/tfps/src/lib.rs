@@ -9,6 +9,7 @@
 
 pub mod apiban;
 pub mod config;
+pub mod drops;
 pub mod store;
 pub mod xdp;
 

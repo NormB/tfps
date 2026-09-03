@@ -413,6 +413,7 @@ precision measure this system has**, so that act is one command.
 tfps_ctl status                       what is running, what is blocked, how fresh the state is
 tfps_ctl stats                        every counter: kernel drops, traffic mix, calibration
 tfps_ctl banned [--why]               condemned sources, with time left and the reason
+tfps_ctl dropped [--limit N] [--ip IP] what blocked sources kept sending, and why they were blocked
 tfps_ctl unban <ip>... | --all        lift a block — takes effect on the next packet
 tfps_ctl ban <ip> [--ttl N]           condemn by hand (default 3600s, 0 = no expiry)
 tfps_ctl sources [--peer --country]   learned sources and the countries they call
@@ -453,7 +454,8 @@ state needs only the database file.
     noise=12 (12%) injection=0 auth_att=142 auth_fail=5 auth_ok=97 auth_chal=104
     auth_volume=0 intl_ok=0 intl_fail=0 invites=62 intl=62 unknown_country=20
     first_time=21 blocks=0 would_block=0 sources=3 ports={5060: 330}
-    XDP: dropped=1840 seen=2100 expired=3 in_map=7 blocked_by_us=7
+    XDP: dropped=1840 seen=2100 expired=3 reported=212 lost=0 in_map=7 blocked_by_us=7
+    still sending: 2 blocked sources, most: 203.0.113.5x1790 198.51.100.7x50
 ```
 
 | field | meaning |
@@ -469,7 +471,21 @@ state needs only the database file.
 | `first_time` | first-time-country events; feeds the learned benign rate |
 | `blocks` / `would_block` | behavioural verdicts (active / during learning) |
 | `sources` | distinct source IPs under watch |
-| `XDP: …` | what the kernel side actually did; `blocked_by_us` is what **this** process condemned |
+| `XDP: …` | what the kernel side actually did; `blocked_by_us` is what **this** process condemned; `reported`/`lost` are the drop events handed to userspace and the ones the ring buffer had no room for |
+| `still sending: …` | blocked sources seen dropping since start, and the most active of them with the kernel's exact drop count |
+
+A packet dropped at XDP is invisible to everything below it, this process's own capture
+included, so the program reports what it drops on a ring buffer before dropping it. The
+daemon prints a `DROPPED peer=… reason=… request="…"` line the first time a blocked
+source is seen still sending and then at most once a minute per source (every event with
+`-v`), and flushes a per-source table at checkpoint that `tfps_ctl dropped` reads. The
+events are sampled — the first four drops from each source in every second — but each one
+carries the source's running count and the daemon reads the kernel's per-source totals
+again at every report and checkpoint, so the numbers are exact even for a source that
+stopped between two events. A source blocked by hand
+with `tfps_ctl ban` is printed as `reason=unrecorded`, because the daemon did not place it.
+Under another product's shared drop map there is no ring buffer, and the startup banner
+says `dropped traffic : NOT observable` rather than reporting nothing.
 
 Silence is an alarm, not normality: TFPS complains when it stops seeing traffic, when there
 is SIP on IPv6/TCP it cannot inspect, when no signature has matched in thousands of messages,

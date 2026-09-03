@@ -35,6 +35,8 @@ use tfps_core::country;
 use tfps_core::disposition::Disposition;
 use tfps_core::engine::{Engine, PeerAnomalyRecord};
 
+use crate::drops::DropRow;
+
 /// Where the database lives unless `--db` says otherwise.
 pub const DEFAULT_PATH: &str = "/var/lib/tfps/tfps.db";
 
@@ -247,7 +249,25 @@ impl Store {
                      ip    TEXT    NOT NULL,
                      actor TEXT    NOT NULL
                  );
-                 CREATE INDEX IF NOT EXISTS unban_log_ip ON unban_log (ip);",
+                 CREATE INDEX IF NOT EXISTS unban_log_ip ON unban_log (ip);
+                 -- What a blocked source kept sending after its block, per source: the
+                 -- XDP program reports its drops on a ring buffer and the daemon flushes
+                 -- this at checkpoint. `drops` is the kernel's exact count; `events` is
+                 -- the sample it reported. Kept off the drop list like block_log: it is
+                 -- evidence about blocks, and the kernel discards the traffic it would
+                 -- be relearned from.
+                 CREATE TABLE IF NOT EXISTS drop_log (
+                     ip         TEXT    PRIMARY KEY,
+                     first_ts   INTEGER NOT NULL,
+                     last_ts    INTEGER NOT NULL,
+                     drops      INTEGER NOT NULL,
+                     events     INTEGER NOT NULL,
+                     last_port  INTEGER NOT NULL,
+                     last_len   INTEGER NOT NULL,
+                     last_proto INTEGER NOT NULL,
+                     last_line  TEXT    NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS drop_log_last ON drop_log (last_ts);",
             )
             .map_err(|e| format!("creating schema: {e}"))?;
         // Columns added to a table that survives the version change. SQLite has no
@@ -608,6 +628,102 @@ impl Store {
     pub fn prune_log(&self, older_than: u32) -> usize {
         self.conn
             .execute("DELETE FROM block_log WHERE ts < ?1", params![older_than])
+            .unwrap_or(0)
+    }
+
+    /// Adds what the daemon saw dropped since its last checkpoint, per source.
+    ///
+    /// The rows are deltas and the table adds them, so a source seen across two
+    /// checkpoints — or two daemon lifetimes, since the kernel's count restarts with the
+    /// process — counts every packet once. The first sighting is kept; everything
+    /// "last" is replaced.
+    ///
+    /// Returns an error rather than swallowing one: a lost row here is a blocked
+    /// source whose behaviour reads as "nothing happened", which is the blindness the
+    /// ring buffer exists to remove.
+    pub fn record_drops(&self, rows: &[DropRow]) -> Result<(), String> {
+        let clamp = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+        for r in rows {
+            self.conn
+                .execute(
+                    "INSERT INTO drop_log
+                         (ip, first_ts, last_ts, drops, events, last_port, last_len,
+                          last_proto, last_line)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                     ON CONFLICT(ip) DO UPDATE SET
+                         drops      = drops + excluded.drops,
+                         events     = events + excluded.events,
+                         last_ts    = excluded.last_ts,
+                         last_port  = excluded.last_port,
+                         last_len   = excluded.last_len,
+                         last_proto = excluded.last_proto,
+                         last_line  = excluded.last_line",
+                    params![
+                        r.ip,
+                        r.first_ts,
+                        r.last_ts,
+                        clamp(r.drops),
+                        clamp(r.events),
+                        r.last_port,
+                        r.last_len,
+                        r.last_proto,
+                        r.last_line
+                    ],
+                )
+                .map(|_| ())
+                .map_err(|e| format!("recording drops from {}: {e}", r.ip))?;
+        }
+        Ok(())
+    }
+
+    /// The dropped sources, most dropped first — what `tfps_ctl dropped` shows.
+    pub fn dropped(&self, limit: usize, ip: Option<&str>) -> Result<Vec<DropRow>, String> {
+        let (sql, args): (&str, Vec<String>) = match ip {
+            Some(v) => (
+                "SELECT ip, first_ts, last_ts, drops, events, last_port, last_len,
+                        last_proto, last_line
+                 FROM drop_log WHERE ip = ?1 ORDER BY drops DESC, ip LIMIT ?2",
+                vec![v.to_string(), limit.to_string()],
+            ),
+            None => (
+                "SELECT ip, first_ts, last_ts, drops, events, last_port, last_len,
+                        last_proto, last_line
+                 FROM drop_log ORDER BY drops DESC, ip LIMIT ?1",
+                vec![limit.to_string()],
+            ),
+        };
+        let mut st = self
+            .conn
+            .prepare(sql)
+            .map_err(|e| format!("reading drop_log: {e}"))?;
+        let rows = st
+            .query_map(rusqlite::params_from_iter(args), |r| {
+                let drops: i64 = r.get(3)?;
+                let events: i64 = r.get(4)?;
+                Ok(DropRow {
+                    ip: r.get(0)?,
+                    first_ts: r.get(1)?,
+                    last_ts: r.get(2)?,
+                    drops: u64::try_from(drops).unwrap_or(0),
+                    events: u64::try_from(events).unwrap_or(0),
+                    last_port: r.get(5)?,
+                    last_len: r.get(6)?,
+                    last_proto: r.get(7)?,
+                    last_line: r.get(8)?,
+                })
+            })
+            .map_err(|e| format!("iterating drop_log: {e}"))?;
+        Ok(rows.flatten().collect())
+    }
+
+    /// Forgets sources not seen dropping since `older_than`. Same window as the block
+    /// log, since the two are read together.
+    pub fn drops_prune(&self, older_than: u32) -> usize {
+        self.conn
+            .execute(
+                "DELETE FROM drop_log WHERE last_ts < ?1",
+                params![older_than],
+            )
             .unwrap_or(0)
     }
 
@@ -1097,6 +1213,150 @@ mod tests {
                 "{table} must still be recreated on a schema change"
             );
         }
+    }
+
+    // ---- R2: what a blocked source kept doing outlives the process ----
+    //
+    // The ring buffer cannot be driven from here (CAP_BPF, an attached program, a
+    // packet from a blocked source). What the daemon does with the events once it
+    // has them CAN be: it flushes per-source deltas at checkpoint, and `tfps_ctl
+    // dropped` reads the rows back in another process.
+
+    fn drop_row(ip: &str, ts: u32, drops: u64, events: u64, line: &str) -> DropRow {
+        DropRow {
+            ip: ip.into(),
+            first_ts: ts,
+            last_ts: ts,
+            drops,
+            events,
+            last_port: 5060,
+            last_len: 300,
+            last_proto: 17,
+            last_line: line.into(),
+        }
+    }
+
+    #[test]
+    fn drops_accumulate_across_checkpoints() {
+        let s = Store::open(&fresh("drops-accumulate")).unwrap();
+        s.record_drops(&[drop_row("198.51.100.7", 100, 7, 1, "OPTIONS sip:a SIP/2.0")])
+            .unwrap();
+        s.record_drops(&[drop_row(
+            "198.51.100.7",
+            160,
+            5,
+            1,
+            "REGISTER sip:b SIP/2.0",
+        )])
+        .unwrap();
+        let rows = s.dropped(10, None).unwrap();
+        assert_eq!(rows.len(), 1, "one row per source");
+        let r = &rows[0];
+        assert_eq!(
+            (r.drops, r.events),
+            (12, 2),
+            "checkpoints write deltas; the row is their sum"
+        );
+        assert_eq!(r.first_ts, 100, "the first sighting is kept");
+        assert_eq!(r.last_ts, 160, "the latest sighting wins");
+        assert_eq!(r.last_line, "REGISTER sip:b SIP/2.0");
+        assert_eq!((r.last_port, r.last_len, r.last_proto), (5060, 300, 17));
+    }
+
+    #[test]
+    fn the_drop_log_survives_a_reopen() {
+        let path = fresh("drops-reopen");
+        {
+            let s = Store::open(&path).unwrap();
+            s.record_drops(&[drop_row("198.51.100.8", 1, 4, 1, "a")])
+                .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let rows = s.dropped(10, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].drops, 4);
+    }
+
+    #[test]
+    fn dropped_sources_read_back_most_active_first() {
+        let s = Store::open(&fresh("drops-order")).unwrap();
+        s.record_drops(&[
+            drop_row("198.51.100.1", 1, 3, 1, "a"),
+            drop_row("198.51.100.2", 1, 10, 1, "b"),
+            drop_row("198.51.100.3", 1, 5, 1, "c"),
+        ])
+        .unwrap();
+        let ips: Vec<String> = s
+            .dropped(10, None)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.ip)
+            .collect();
+        assert_eq!(ips, ["198.51.100.2", "198.51.100.3", "198.51.100.1"]);
+        assert_eq!(s.dropped(1, None).unwrap().len(), 1, "the limit applies");
+    }
+
+    #[test]
+    fn dropped_can_be_narrowed_to_one_source() {
+        let s = Store::open(&fresh("drops-one")).unwrap();
+        s.record_drops(&[
+            drop_row("198.51.100.1", 1, 3, 1, "a"),
+            drop_row("198.51.100.2", 1, 10, 1, "b"),
+        ])
+        .unwrap();
+        let rows = s.dropped(10, Some("198.51.100.1")).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ip, "198.51.100.1");
+    }
+
+    #[test]
+    fn an_empty_drop_log_reads_as_empty_and_not_as_an_error() {
+        let s = Store::open(&fresh("drops-empty")).unwrap();
+        assert!(s.dropped(10, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_failed_drop_write_is_reported_rather_than_swallowed() {
+        let s = Store::open(&fresh("drops-broken")).unwrap();
+        s.conn.execute_batch("DROP TABLE drop_log;").unwrap();
+        assert!(
+            s.record_drops(&[drop_row("198.51.100.1", 1, 1, 1, "a")])
+                .is_err(),
+            "a lost row is a blocked source whose behaviour reads as nothing happened"
+        );
+        assert!(
+            s.dropped(10, None).is_err(),
+            "a broken read is an error, not an empty result"
+        );
+    }
+
+    #[test]
+    fn drop_rows_prune_by_last_sighting() {
+        let s = Store::open(&fresh("drops-prune")).unwrap();
+        s.record_drops(&[
+            drop_row("198.51.100.1", 100, 1, 1, "a"),
+            drop_row("198.51.100.2", 500, 1, 1, "b"),
+        ])
+        .unwrap();
+        assert_eq!(s.drops_prune(200), 1);
+        let ips: Vec<String> = s
+            .dropped(10, None)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.ip)
+            .collect();
+        assert_eq!(ips, ["198.51.100.2"]);
+    }
+
+    // The same rule as block_log: this is evidence about blocks, not learned state,
+    // and it cannot be relearned from traffic the kernel discards.
+    #[test]
+    fn the_migration_does_not_drop_the_drop_log() {
+        let list = drop_list(include_str!("store.rs"));
+        assert!(
+            !list.contains("drop_log"),
+            "drop_log is on the drop list; what blocked sources did would not survive a version bump"
+        );
     }
 
     // Debt 1 (I ran a push from the wrong repository directory and it targeted

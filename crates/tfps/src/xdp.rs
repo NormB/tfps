@@ -12,10 +12,18 @@
 
 use std::net::Ipv4Addr;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, TrySendError};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
-use aya::maps::{Array, HashMap as BpfHashMap, Map, MapData};
+use aya::maps::{Array, HashMap as BpfHashMap, Map, MapData, RingBuf};
 use aya::programs::{Xdp, XdpMode};
 use aya::Ebpf;
+
+use crate::drops::{
+    drop_line, parse_event, parse_window_drops, Announce, DropRow, DropSummary, Ledger, WINDOW_LEN,
+};
 
 /// Where the BPF object is looked for when `--xdp-obj` is not given.
 pub const DEFAULT_OBJ: &str = "/usr/local/lib/tfps/tfps_xdp.o";
@@ -31,10 +39,33 @@ pub const DEFAULT_OBJ: &str = "/usr/local/lib/tfps/tfps_xdp.o";
 /// keeps sngrep clean.
 pub const SIPVAULT_DROP_MAP: &str = "/sys/fs/bpf/sipvault/drop_ips";
 
-/// Indices into the counter array, mirroring `ebpf/tfps_xdp.c`.
-const C_DROPPED: u32 = 0;
-const C_SEEN: u32 = 1;
-const C_EXPIRED: u32 = 2;
+/// Index of `dropped` in the counter array, mirroring `ebpf/tfps_xdp.c`.
+pub const C_DROPPED: u32 = 0;
+/// Index of `seen`: packets on a watched port, blocked or not.
+pub const C_SEEN: u32 = 1;
+/// Index of `expired`: blocks that lapsed on their own.
+pub const C_EXPIRED: u32 = 2;
+/// Index of `reported`: drop events handed to userspace.
+pub const C_REPORTED: u32 = 3;
+/// Index of `lost`: drop events the ring buffer had no room for.
+pub const C_LOST: u32 = 4;
+
+/// The ring buffer the program reports drops on.
+pub const DROP_EVENTS_MAP: &str = "drop_events";
+/// The program's per-source sampling windows.
+pub const DROP_WINDOWS_MAP: &str = "drop_windows";
+
+/// How often the drain thread looks at the ring buffer when it is empty.
+///
+/// A poll rather than a wakeup: waiting on the descriptor needs `poll(2)`, which means
+/// `libc` and `unsafe`, and the workspace forbids the second. Twenty milliseconds is
+/// well under any latency that matters here — the packet was already dropped — and at
+/// 8192 records per megabyte the ring drains four hundred thousand events a second.
+const DROP_POLL: Duration = Duration::from_millis(20);
+/// Announcements queued for the main loop before the drain thread starts counting
+/// them as unannounced. Announcements are already capped at one per source per minute,
+/// so this fills only when the main loop has stalled.
+const ANNOUNCE_QUEUE: usize = 4096;
 
 /// How enforcement was obtained.
 pub enum Backend {
@@ -55,6 +86,9 @@ pub struct Enforcer {
     /// Human-readable description of where enforcement is happening — it goes into the
     /// report, because the operator needs to know who is doing the blocking.
     pub mode: String,
+    /// What the program drops, as it reports it. `None` under a shared map — another
+    /// product's program has no ring buffer of ours — or when the object predates it.
+    drops: Option<DropSensor>,
 }
 
 /// Counters read from the kernel.
@@ -63,6 +97,26 @@ pub struct Counters {
     pub dropped: u64,
     pub seen: u64,
     pub expired: u64,
+    /// Drop events handed to userspace — the sample, not the volume.
+    pub reported: u64,
+    /// Drop events the ring buffer had no room for. Non-zero means the sample is
+    /// thinner than the policy says, and the operator is told so.
+    pub lost: u64,
+}
+
+impl Counters {
+    fn read<T: std::borrow::Borrow<MapData>>(arr: &Array<T, u64>) -> Self {
+        // An object built before the ring buffer existed has three entries; the two
+        // new indices read as zero there rather than failing the whole read.
+        let at = |i: u32| arr.get(&i, 0).unwrap_or(0);
+        Self {
+            dropped: at(C_DROPPED),
+            seen: at(C_SEEN),
+            expired: at(C_EXPIRED),
+            reported: at(C_REPORTED),
+            lost: at(C_LOST),
+        }
+    }
 }
 
 impl Enforcer {
@@ -72,11 +126,15 @@ impl Enforcer {
     /// Failure here is **never silent**: the caller must say so loudly and carry on in
     /// observe-only mode. An anti-fraud system that appears to protect without protecting
     /// is exactly the criticism this project levels at the incumbent.
+    ///
+    /// `verbose` makes every reported drop an announcement rather than one per source
+    /// per minute; it is the daemon's `-v`.
     pub fn attach(
         shared_map: &Path,
         obj: &Path,
         iface: &str,
         ports: &[u16],
+        verbose: bool,
     ) -> Result<Self, String> {
         if shared_map.exists() {
             match Self::use_shared(shared_map) {
@@ -91,7 +149,7 @@ impl Enforcer {
                 }
             }
         }
-        Self::load(obj, iface, ports)
+        Self::load(obj, iface, ports, verbose)
     }
 
     fn use_shared(path: &Path) -> Result<Self, String> {
@@ -104,6 +162,7 @@ impl Enforcer {
             mode: format!("shared map {}", path.display()),
             blocked_by_us: 0,
             backend: Backend::Shared { map },
+            drops: None,
         })
     }
 
@@ -120,7 +179,7 @@ impl Enforcer {
         BpfHashMap::try_from(wrapped).map_err(|e| format!("{e}"))
     }
 
-    fn load(obj: &Path, iface: &str, ports: &[u16]) -> Result<Self, String> {
+    fn load(obj: &Path, iface: &str, ports: &[u16], verbose: bool) -> Result<Self, String> {
         if !obj.exists() {
             return Err(format!(
                 "BPF object not found at {}. Build it with: \
@@ -157,10 +216,27 @@ impl Enforcer {
             },
         };
 
+        // The sensor for what the program drops. Its absence is a warning and not an
+        // error: enforcement still works, but a block would be unobservable from the
+        // inside, which is the defect the ring buffer exists to remove — so it is said.
+        let mut bpf = bpf;
+        let drops = match DropSensor::start(&mut bpf, verbose) {
+            Ok(s) => Some(s),
+            Err(err) => {
+                eprintln!(
+                    "WARNING: what XDP drops will be INVISIBLE — {err}. Rebuild {} from \
+                     ebpf/tfps_xdp.c (packaging/install.sh does it).",
+                    obj.display()
+                );
+                None
+            }
+        };
+
         let mut me = Self {
             mode: format!("own program, XDP {mode} on {iface}"),
             blocked_by_us: 0,
             backend: Backend::Own { bpf: Box::new(bpf) },
+            drops,
         };
         me.publish_ports(ports)?;
         Ok(me)
@@ -228,11 +304,7 @@ impl Enforcer {
         let Ok(arr) = Array::<_, u64>::try_from(map) else {
             return Counters::default();
         };
-        Counters {
-            dropped: arr.get(&C_DROPPED, 0).unwrap_or(0),
-            seen: arr.get(&C_SEEN, 0).unwrap_or(0),
-            expired: arr.get(&C_EXPIRED, 0).unwrap_or(0),
-        }
+        Counters::read(&arr)
     }
 
     /// How many sources are condemned right now.
@@ -245,6 +317,219 @@ impl Enforcer {
                 .map(|m| m.keys().count())
                 .unwrap_or(0),
         }
+    }
+
+    /// Whether what the program drops can be seen at all. False under a shared map,
+    /// whose owner's program has no ring buffer of ours, and under an object that
+    /// predates the ring buffer.
+    pub fn drops_observable(&self) -> bool {
+        self.drops.is_some()
+    }
+
+    /// Records why this process blocked `ip`, so its later drops can say so.
+    pub fn note_block(&self, ip: Ipv4Addr, kind: &str, detail: &str) {
+        if let Some(d) = &self.drops {
+            d.note_block(ip, kind, detail);
+        }
+    }
+
+    /// `DROPPED` lines queued since the last call, ready for the journal.
+    pub fn drop_announcements(&self) -> Vec<Announcement> {
+        self.drops
+            .as_ref()
+            .map(DropSensor::announcements)
+            .unwrap_or_default()
+    }
+
+    /// How many sources have been seen dropping, and the `top` most dropped of them.
+    pub fn dropped_sources(&self, top: usize) -> (usize, Vec<DropSummary>) {
+        self.drops
+            .as_ref()
+            .map(|d| d.dropped_sources(top))
+            .unwrap_or_default()
+    }
+
+    /// What the database is owed since the last checkpoint, in wall-clock time.
+    pub fn flush_drops(&self, now_wall: u32) -> Vec<DropRow> {
+        self.drops
+            .as_ref()
+            .map(|d| d.flush(now_wall))
+            .unwrap_or_default()
+    }
+
+    /// `(malformed, unannounced, unsynced)`: records the drain thread could not read,
+    /// lines it could not queue, and per-source map entries the report could not
+    /// read. Each is a defect worth a warning, never a silent zero.
+    pub fn drop_sensor_losses(&self) -> (u64, u64, u64) {
+        self.drops
+            .as_ref()
+            .map(DropSensor::losses)
+            .unwrap_or_default()
+    }
+}
+
+/// A `DROPPED` line ready for the journal, and how loud it is.
+pub struct Announcement {
+    /// First sighting, a repeat after the interval, or a verbose-only line.
+    pub kind: Announce,
+    /// The line itself, as [`drop_line`] formats it.
+    pub line: String,
+}
+
+/// The drain side of the ring buffer: its own thread, a ledger, and a queue of lines.
+///
+/// Off the packet path by construction (`SPEC.md` §10): the thread owns the ring buffer
+/// and folds events into the ledger as they arrive; the main loop only ever picks up
+/// finished lines and, at report and checkpoint time, reads the ledger under the lock.
+pub struct DropSensor {
+    ledger: Arc<Mutex<Ledger>>,
+    rx: Receiver<Announcement>,
+    /// The program's per-source sampling map. The events are a sample; this is the
+    /// total, read before every report and checkpoint so a source that stopped
+    /// mid-window is counted in full and not up to its last reported packet.
+    windows: BpfHashMap<MapData, u32, [u8; WINDOW_LEN]>,
+    malformed: Arc<AtomicU64>,
+    unannounced: Arc<AtomicU64>,
+    unsynced: AtomicU64,
+}
+
+/// A poisoned lock means the other side panicked mid-update; the ledger is still the
+/// best record there is, and refusing to read it would silence the sensor.
+fn lock_ledger(m: &Mutex<Ledger>) -> MutexGuard<'_, Ledger> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl DropSensor {
+    /// Takes the ring buffer out of the loaded object and starts draining it.
+    ///
+    /// The kernel side cannot be driven from a test — it needs `CAP_BPF`, an attached
+    /// program and a packet from a blocked source — so this function is kept to the
+    /// plumbing, and everything it does with an event is a call into `drops`, which is.
+    fn start(bpf: &mut Ebpf, verbose: bool) -> Result<Self, String> {
+        let map = bpf
+            .take_map(DROP_EVENTS_MAP)
+            .ok_or_else(|| format!("the BPF object has no `{DROP_EVENTS_MAP}` ring buffer"))?;
+        let mut ring =
+            RingBuf::try_from(map).map_err(|e| format!("opening `{DROP_EVENTS_MAP}`: {e}"))?;
+        let windows = bpf
+            .take_map(DROP_WINDOWS_MAP)
+            .ok_or_else(|| format!("the BPF object has no `{DROP_WINDOWS_MAP}` map"))?;
+        let windows: BpfHashMap<MapData, u32, [u8; WINDOW_LEN]> = BpfHashMap::try_from(windows)
+            .map_err(|e| {
+                format!("opening `{DROP_WINDOWS_MAP}` as hash<u32,[u8;{WINDOW_LEN}]>: {e}")
+            })?;
+        let ledger = Arc::new(Mutex::new(Ledger::new()));
+        let malformed = Arc::new(AtomicU64::new(0));
+        let unannounced = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = mpsc::sync_channel(ANNOUNCE_QUEUE);
+        let worker = (ledger.clone(), malformed.clone(), unannounced.clone());
+        std::thread::Builder::new()
+            .name("tfps-drops".into())
+            .spawn(move || {
+                let (ledger, malformed, unannounced) = worker;
+                loop {
+                    while let Some(item) = ring.next() {
+                        let ev = match parse_event(&item) {
+                            Ok(ev) => ev,
+                            Err(_) => {
+                                // The two sides disagree on the layout. Counted and
+                                // reported by the main loop; a parse that cannot be
+                                // trusted must not become a line that is.
+                                malformed.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                        };
+                        let (kind, line) = {
+                            let mut l = lock_ledger(&ledger);
+                            let kind = l.record(&ev);
+                            let Some(s) = l.summary(ev.src) else {
+                                continue;
+                            };
+                            (kind, drop_line(&ev, s))
+                        };
+                        if kind == Announce::Quiet && !verbose {
+                            continue;
+                        }
+                        match tx.try_send(Announcement { kind, line }) {
+                            Ok(()) => {}
+                            Err(TrySendError::Full(_)) => {
+                                unannounced.fetch_add(1, Ordering::Relaxed);
+                            }
+                            // The main loop is gone; so is any reason to drain.
+                            Err(TrySendError::Disconnected(_)) => return,
+                        }
+                    }
+                    std::thread::sleep(DROP_POLL);
+                }
+            })
+            .map_err(|e| format!("spawning the drain thread: {e}"))?;
+        Ok(Self {
+            ledger,
+            rx,
+            windows,
+            malformed,
+            unannounced,
+            unsynced: AtomicU64::new(0),
+        })
+    }
+
+    /// Folds the kernel's per-source totals into the ledger.
+    ///
+    /// An entry that cannot be read is counted, not skipped in silence: a sync that
+    /// quietly fails leaves the report at the sample's count, which is the defect
+    /// this method exists to remove.
+    fn sync(&self) {
+        let now = monotonic_ns();
+        let mut ledger = lock_ledger(&self.ledger);
+        for entry in self.windows.iter() {
+            match entry {
+                Ok((key, value)) => match parse_window_drops(&value) {
+                    // The key is the raw `ip->saddr`, the same encoding as `blocked`.
+                    Some(drops) => ledger.sync_count(Ipv4Addr::from(key.to_ne_bytes()), drops, now),
+                    None => {
+                        self.unsynced.fetch_add(1, Ordering::Relaxed);
+                    }
+                },
+                Err(_) => {
+                    self.unsynced.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    fn note_block(&self, ip: Ipv4Addr, kind: &str, detail: &str) {
+        lock_ledger(&self.ledger).note_block(ip, kind, detail, monotonic_ns());
+    }
+
+    fn announcements(&self) -> Vec<Announcement> {
+        self.rx.try_iter().collect()
+    }
+
+    fn dropped_sources(&self, top: usize) -> (usize, Vec<DropSummary>) {
+        self.sync();
+        let l = lock_ledger(&self.ledger);
+        (
+            l.len(),
+            l.summaries().into_iter().take(top).cloned().collect(),
+        )
+    }
+
+    fn flush(&self, now_wall: u32) -> Vec<DropRow> {
+        self.sync();
+        let mono = monotonic_ns();
+        lock_ledger(&self.ledger)
+            .flush()
+            .iter()
+            .map(|d| d.to_row(now_wall, mono))
+            .collect()
+    }
+
+    fn losses(&self) -> (u64, u64, u64) {
+        (
+            self.malformed.load(Ordering::Relaxed),
+            self.unannounced.load(Ordering::Relaxed),
+            self.unsynced.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -411,11 +696,7 @@ pub fn live_counters() -> Result<Counters, String> {
     let data = MapData::from_id(id).map_err(|e| format!("opening counters map: {e}"))?;
     let arr = Array::<_, u64>::try_from(Map::Array(data))
         .map_err(|e| format!("counters is not an array<u64>: {e}"))?;
-    Ok(Counters {
-        dropped: arr.get(&C_DROPPED, 0).unwrap_or(0),
-        seen: arr.get(&C_SEEN, 0).unwrap_or(0),
-        expired: arr.get(&C_EXPIRED, 0).unwrap_or(0),
-    })
+    Ok(Counters::read(&arr))
 }
 
 /// Every IPv4 address configured on this host.

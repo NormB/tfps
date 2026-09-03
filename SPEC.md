@@ -43,7 +43,8 @@ packet on a captured port
    ├─ perimeter (XDP) ──── known noise? ──► XDP_DROP, total silence
    │                       (user-agent, IP, rate)      [never answers]
    │
-   ├─ event to userspace over a ring buffer (always, even when dropped)
+   ├─ drop event to userspace over a ring buffer (sampled: the first 4 drops
+   │  per source per second; every event carries the source's exact count)
    │
    └─ Rust userspace
         │
@@ -153,6 +154,12 @@ with the minimum-samples guard now realised as the Bayesian population prior; an
 Sources: a list of user-agents and IP ranges in the JSON; rate; optionally APIBAN. Active **from installation**, without waiting for learning.
 
 **Observing and dropping happen in the same XDP program** — the event goes to the ring buffer **before** the `XDP_DROP`, so that the silence does not blind the sensor itself.
+
+A dropped packet never becomes an `sk_buff`, so nothing below XDP sees it: not the softswitch, not an analyzer on the box, and not this product's own `AF_PACKET` sensor, which reads the same tap. Without the event the counters would be the entire record of what enforcement does, and a wrong block would be unobservable from the inside — the system could not notice it is wrong about a source. The event carries the timestamp, the source, the ports, the declared payload length and the first 96 bytes of payload, which is the SIP request line.
+
+**The flood cost is bounded by sampling, not ignored.** The source being dropped is by definition the one sending the most, and one event per dropped packet would make the sensor pay per packet for the traffic XDP exists to make free. The program reports the **first 4 drops from each source in every one-second window** and only counts the rest; every event carries the source's running drop count, and the per-source map that holds it is read again at report and checkpoint time, so userspace knows the exact volume from a sample — a source that stops mid-window is counted in full, not up to its last reported packet — and a source that goes quiet and returns is reported again on its first packet. A ring buffer with no room — userspace not draining fast enough — is counted as `lost` and never delays the drop: reporting is best effort, dropping is not.
+
+Userspace drains the ring buffer on its own thread, off the packet path (§10). A dropped source is announced once when it first appears and then at most once a minute (`DROPPED` lines, with the reason this process blocked it for), kept in a bounded per-source ledger, flushed to `drop_log` at checkpoint, and read back by `tfps_ctl dropped`. Under a third party's shared drop map there is no ring buffer, and the product says so at startup rather than reporting nothing.
 
 ---
 

@@ -472,13 +472,30 @@ fn main() -> ExitCode {
             .clone()
             .or_else(xdp::default_interface)
             .unwrap_or_else(|| "eth0".to_string());
-        match xdp::Enforcer::attach(&args.shared_map, &args.xdp_obj, &iface, &args.ports) {
+        match xdp::Enforcer::attach(
+            &args.shared_map,
+            &args.xdp_obj,
+            &iface,
+            &args.ports,
+            args.verbose,
+        ) {
             Ok(e) => {
                 say!(
                     "  enforcement       : {} — garbage vanishes from sngrep",
                     e.mode
                 );
                 say!("  block expires in  : {}s", args.block_ttl);
+                // A drop is invisible to everything below XDP, this process included.
+                // Whether it can be seen at all is stated here, because "nothing
+                // dropped" and "cannot see what dropped" must never read the same.
+                if e.drops_observable() {
+                    say!(
+                        "  dropped traffic   : reported (first few drops per source per \
+                         second; DROPPED lines, tfps_ctl dropped)"
+                    );
+                } else {
+                    say!("  dropped traffic   : NOT observable from this process");
+                }
                 Some(e)
             }
             Err(err) => {
@@ -604,7 +621,10 @@ fn main() -> ExitCode {
                             continue;
                         }
                         match e.block(ip, 0) {
-                            Ok(()) => restored += 1,
+                            Ok(()) => {
+                                e.note_block(ip, "apiban", "restored");
+                                restored += 1;
+                            }
                             // Announcing a restore that did not happen would leave the
                             // operator believing in protection that is not there.
                             Err(_) => failed += 1,
@@ -631,6 +651,11 @@ fn main() -> ExitCode {
     let (mut n_ipv6, mut n_tcp, mut n_frag) = (0u64, 0u64, 0u64);
     let mut blind_warned = false;
     let mut auth_blind_warned = false;
+    // The drop sensor's own losses: said once each time they grow, never absorbed.
+    let mut lost_warned_at = 0u64;
+    let mut unannounced_warned_at = 0u64;
+    let mut unsynced_warned_at = 0u64;
+    let mut malformed_warned = false;
 
     loop {
         let n = match sock.read(&mut buf) {
@@ -726,10 +751,14 @@ fn main() -> ExitCode {
                                 continue;
                             };
                             match e.block(subject, args.block_ttl) {
-                                Ok(()) => say!(
-                                    "BLOCKED peer={subject} reason={kind} detail={detail} ttl={}s",
-                                    args.block_ttl
-                                ),
+                                Ok(()) => {
+                                    // So the DROPPED lines that follow can say why.
+                                    e.note_block(subject, kind, detail);
+                                    say!(
+                                        "BLOCKED peer={subject} reason={kind} detail={detail} ttl={}s",
+                                        args.block_ttl
+                                    )
+                                }
                                 Err(err) => {
                                     // Nothing was blocked, so nothing is recorded: an audit
                                     // row for a block that did not happen is a false label.
@@ -780,6 +809,14 @@ fn main() -> ExitCode {
             }
         }
 
+        // What the program dropped, as its drain thread reported it. Non-blocking, and
+        // already rate-limited per source, so a blocked flood costs one line a minute.
+        if let Some(e) = enforcer.as_ref() {
+            for a in e.drop_announcements() {
+                say!("{}", a.line);
+            }
+        }
+
         // APIBAN batches, if any. Non-blocking: it only drains what has already arrived.
         if let (Some(rx), Some(e)) = (apiban_rx.as_ref(), enforcer.as_mut()) {
             while let Ok(batch) = rx.try_recv() {
@@ -820,6 +857,7 @@ fn main() -> ExitCode {
                         n -= 1;
                         continue;
                     }
+                    e.note_block(ip, "apiban", "feed");
                 }
                 if n > 0 {
                     apiban_total += n as u64;
@@ -850,6 +888,16 @@ fn main() -> ExitCode {
                 // both apply whether or not behavioural detection is on.
                 s.prune_log(t.0.saturating_sub(90 * 24 * 3600));
                 s.apiban_prune(t.0.saturating_sub(APIBAN_RETENTION_SECS));
+                // What the blocked sources kept sending, as deltas since the last
+                // checkpoint. Never fatal, never silent: a lost row is a blocked source
+                // whose behaviour reads as "nothing happened".
+                if let Some(e) = enforcer.as_ref() {
+                    let rows = e.flush_drops(t.0);
+                    if let Err(err) = s.record_drops(&rows) {
+                        eprintln!("WARNING: {err}");
+                    }
+                }
+                s.drops_prune(t.0.saturating_sub(90 * 24 * 3600));
                 // Known-good peers persist in every mode — they are perimeter protection.
                 if let Err(e) = s.save_known_peers(engine.export_known_peers()) {
                     eprintln!("WARNING: could not persist known peers: {e}");
@@ -885,13 +933,60 @@ fn main() -> ExitCode {
                 if e.has_own_counters() {
                     let c = e.counters();
                     say!(
-                        "    XDP: dropped={} seen={} expired={} in_map={} blocked_by_us={}",
+                        "    XDP: dropped={} seen={} expired={} reported={} lost={} in_map={} blocked_by_us={}",
                         c.dropped,
                         c.seen,
                         c.expired,
+                        c.reported,
+                        c.lost,
                         e.blocked_count(),
                         e.blocked_by_us
                     );
+                    let (n, top) = e.dropped_sources(3);
+                    if n > 0 {
+                        let top: Vec<String> = top
+                            .iter()
+                            .map(|s| format!("{}x{}", s.src, s.drops))
+                            .collect();
+                        say!(
+                            "    still sending: {n} blocked sources, most: {}",
+                            top.join(" ")
+                        );
+                    }
+                    // A thinner sample than the policy says is a fact the operator
+                    // reads counts through; each of these is said once as it grows.
+                    if c.lost > lost_warned_at {
+                        eprintln!(
+                            "WARNING: {} drop events had no room in the ring buffer — the \
+                             sample of dropped traffic is thinner than the policy says",
+                            c.lost
+                        );
+                        lost_warned_at = c.lost;
+                    }
+                    let (malformed, unannounced, unsynced) = e.drop_sensor_losses();
+                    if unsynced > unsynced_warned_at {
+                        eprintln!(
+                            "WARNING: {unsynced} per-source drop counts could not be read \
+                             from the kernel map — the counts above may stop at the last \
+                             reported packet"
+                        );
+                        unsynced_warned_at = unsynced;
+                    }
+                    if malformed > 0 && !malformed_warned {
+                        eprintln!(
+                            "WARNING: {malformed} drop events could not be read — the BPF \
+                             object and this binary disagree on the event layout; rebuild \
+                             both from the same checkout"
+                        );
+                        malformed_warned = true;
+                    }
+                    if unannounced > unannounced_warned_at {
+                        eprintln!(
+                            "WARNING: {unannounced} DROPPED lines were not printed because \
+                             the main loop fell behind"
+                        );
+                        unannounced_warned_at = unannounced;
+                    }
                 } else {
                     // A third-party map: the total is mostly theirs. Only what this
                     // process wrote can be claimed as ours.
