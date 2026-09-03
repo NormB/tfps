@@ -263,6 +263,8 @@ The project's declared differentiator against `fail2ban` is that **the incumbent
 6. **Manual unblocking is the precision proxy.** With no labels it is the only measure available: if the operator never unblocks, precision is probably good.
 7. **Which mode it is in** — learning or active — visible the whole time.
 
+**A second opinion, on request.** `--hep-send host:port` forwards a copy of every SIP message the sensor observes, encapsulated as HEP v3 (the Homer/EEP capture protocol, generic chunks only), to an external UDP collector — so whoever runs one can hold every condemnation against the packets that caused it, without this project growing a packet store, a message database or a UI. Off unless asked for: absent, no socket is opened and nothing runs on the packet path. Present, the copy leaves through a bounded queue on its own thread, so a collector that cannot keep up costs drops — counted, printed at every stats interval as `HEP to <collector>: hep_sent= hep_dropped= hep_failed=`, and carried on the checkpoint line that `tfps_ctl stats` shows — never capture (§10). `--hep-agent-id N` names this sensor in the stream.
+
 ### The user's first success
 
 **A clean sngrep.** A packet dropped in XDP never becomes an `sk_buff` and therefore **does not show up in sngrep, tcpdump or tshark** — libpcap hooks into `AF_PACKET`, at netdev level, after XDP. The user installs it, opens sngrep, and the garbage is gone. There need be no fraud, the model need not fire, no dashboard is needed.

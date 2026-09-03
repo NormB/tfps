@@ -400,6 +400,8 @@ why).
 | `--apiban-key KEY` | enable APIBAN, in the background |
 | `--config PATH` | configuration (default `/etc/tfps/config.json`) |
 | `--db PATH` / `--no-db` | SQLite database, or run without persistence |
+| `--hep-send HOST:PORT` | send a HEP v3 copy of every SIP message to an external UDP collector |
+| `--hep-agent-id N` | the capture agent id in each HEP packet (default `2033`) |
 | `-v` / `--debug-unparsed` | verbose; show payloads that failed to parse |
 
 ---

@@ -10,6 +10,7 @@
 pub mod apiban;
 pub mod config;
 pub mod drops;
+pub mod hep;
 pub mod store;
 pub mod xdp;
 

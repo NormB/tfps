@@ -9,7 +9,7 @@
 //!
 //! Needs `CAP_NET_RAW` (capture), plus `CAP_BPF` and `CAP_NET_ADMIN` (XDP).
 
-use tfps::{apiban, config, say, store, xdp};
+use tfps::{apiban, config, hep, say, store, xdp};
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -69,6 +69,11 @@ struct Args {
     peer_plans: Vec<(Ipv4Addr, DialPlan)>,
     /// Which flags the operator actually passed — the file only fills in the rest.
     given: std::collections::HashSet<String>,
+    /// `host:port` of a HEP collector that gets a copy of every SIP message. `None` means
+    /// no socket, no thread and nothing on the packet path.
+    hep_send: Option<String>,
+    /// The capture agent ID in each HEP packet; `None` takes the module's default.
+    hep_agent_id: Option<u32>,
 }
 
 impl Default for Args {
@@ -100,6 +105,8 @@ impl Default for Args {
             config: PathBuf::from(config::DEFAULT_PATH),
             peer_plans: Vec::new(),
             given: std::collections::HashSet::new(),
+            hep_send: None,
+            hep_agent_id: None,
         }
     }
 }
@@ -130,6 +137,8 @@ USAGE: tfps [options]
       --home-country ISO   your own country, not treated as international (repeatable)
       --signatures PATH    file that ADDS signatures to the built-in ones
       --config PATH        configuration               (default: /etc/tfps/config.json)
+      --hep-send HOST:PORT send a HEP v3 copy of every SIP message to this UDP collector
+      --hep-agent-id N     capture agent id in each HEP packet (default: 2033)
   -h, --help               this help
 
 Capture is AF_PACKET; it opens no UDP socket and does not clash with the softswitch.
@@ -138,8 +147,14 @@ Requires CAP_NET_RAW (run as root).
 }
 
 fn parse_args() -> Result<Args, String> {
+    parse_args_from(&std::env::args().skip(1).collect::<Vec<_>>())
+}
+
+/// The parser proper, over an argument list rather than the process's own, so that what
+/// a flag does -- and what its absence leaves untouched -- can be asserted.
+fn parse_args_from(argv: &[String]) -> Result<Args, String> {
     let mut a = Args::default();
-    let mut it = std::env::args().skip(1);
+    let mut it = argv.iter().cloned();
     while let Some(arg) = it.next() {
         a.given.insert(arg.clone());
         let mut next = |name: &str| it.next().ok_or_else(|| format!("{name} requires a value"));
@@ -194,11 +209,29 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|e| format!("{e}"))?;
             }
+            "--hep-send" => {
+                let v = next("--hep-send")?;
+                if !v.contains(':') {
+                    return Err(format!("--hep-send expects host:port, got \"{v}\""));
+                }
+                a.hep_send = Some(v);
+            }
+            "--hep-agent-id" => {
+                a.hep_agent_id = Some(
+                    next("--hep-agent-id")?
+                        .parse()
+                        .map_err(|e| format!("--hep-agent-id: {e}"))?,
+                );
+            }
             other => return Err(format!("unknown option: {other}")),
         }
     }
     if a.ports.is_empty() {
         return Err("no ports to watch".into());
+    }
+    // An id with nowhere to send is a flag the operator believes is doing something.
+    if a.hep_agent_id.is_some() && a.hep_send.is_none() {
+        return Err("--hep-agent-id has no effect without --hep-send".into());
     }
     Ok(a)
 }
@@ -543,6 +576,27 @@ fn main() -> ExitCode {
         say!("                      {label} ({kind})");
     }
 
+    // A second opinion, on request: a HEP v3 copy of every SIP message to an external
+    // collector. Built only from the flag, so its absence opens nothing and costs nothing.
+    let forwarder = match args.hep_send.as_deref() {
+        None => None,
+        Some(target) => {
+            let agent = args.hep_agent_id.unwrap_or(hep::DEFAULT_AGENT_ID);
+            match hep::Forwarder::start(target, agent) {
+                Ok((f, addr)) => {
+                    say!("  HEP forwarding    : every SIP message to {addr} (agent id {agent})");
+                    Some((f, addr))
+                }
+                // The operator asked for it by name; starting without it would be the
+                // silent kind of failure this project exists to not have.
+                Err(e) => {
+                    eprintln!("error: --hep-send {target}: {e}");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+    };
+
     let sock = match Socket::new(
         Domain::from(AF_PACKET),
         Type::DGRAM,
@@ -699,6 +753,22 @@ fn main() -> ExitCode {
                 let on_port = args.ports.contains(&d.dst_port) || args.ports.contains(&d.src_port);
                 if on_port {
                     *seen_ports.entry(d.dst_port).or_insert(0) += 1;
+                    if let Some((f, _)) = forwarder.as_ref() {
+                        // The copy leaves before the verdict: a source condemned below is
+                        // gone from the wire next, and this packet is the evidence.
+                        let at = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default();
+                        f.forward(&hep::Observed {
+                            src: d.src,
+                            dst: d.dst,
+                            src_port: d.src_port,
+                            dst_port: d.dst_port,
+                            secs: at.as_secs() as u32,
+                            usecs: at.subsec_micros(),
+                            payload: d.payload,
+                        });
+                    }
                     // Both addresses go in: a request is judged on its sender, but a
                     // `401` is evidence about whoever is *receiving* it. The engine returns
                     // the subject so the block lands on the right party.
@@ -873,7 +943,10 @@ fn main() -> ExitCode {
                 // The control tool runs in another process and cannot read these
                 // counters from memory. Writing them at checkpoint is what lets
                 // `tfps_ctl stats` show the whole picture instead of only the kernel half.
-                s.meta_set("stats", &counter_line(&engine.stats));
+                s.meta_set(
+                    "stats",
+                    &counter_line(&engine.stats, forwarder.as_ref().map(|(f, _)| f.counters())),
+                );
                 s.meta_set("stats_ts", &t.0.to_string());
                 s.meta_set("started_at", &start.0.to_string());
                 s.meta_set(
@@ -997,6 +1070,11 @@ fn main() -> ExitCode {
                     );
                 }
             }
+            if let Some((f, addr)) = forwarder.as_ref() {
+                // Drops and failures are the collector's health as seen from here; a
+                // number that only ever grew would be worth a look.
+                say!("    HEP to {addr}: {}", f.counters().line());
+            }
             // Observability requirement: silence is an alarm, not normality.
             if engine.stats.packets == 0 && !nothing_seen_warned {
                 eprintln!(
@@ -1112,8 +1190,12 @@ fn report(dec: &Decision, peer: Ipv4Addr, verbose: bool) {
 ///
 /// Hand-rolled rather than serialised: the reader is one function in `tfps_ctl`, the format
 /// is greppable by eye in `sqlite3`, and a new counter costs one line here.
-fn counter_line(s: &tfps_core::engine::Stats) -> String {
-    [
+///
+/// The HEP counters ride on the same line, so `tfps_ctl stats` shows them with no code of
+/// its own -- and so a run without the flag leaves no stale HEP numbers behind, because the
+/// whole line is rewritten at every checkpoint.
+fn counter_line(s: &tfps_core::engine::Stats, hep: Option<hep::Counters>) -> String {
+    let line = [
         ("packets", s.packets),
         ("sip", s.sip_parsed),
         ("responses", s.responses),
@@ -1140,7 +1222,11 @@ fn counter_line(s: &tfps_core::engine::Stats) -> String {
     .iter()
     .map(|(k, v)| format!("{k}={v}"))
     .collect::<Vec<_>>()
-    .join(" ")
+    .join(" ");
+    match hep {
+        Some(c) => format!("{line} {}", c.line()),
+        None => line,
+    }
 }
 
 fn print_stats(e: &Engine, ports: &BTreeMap<u16, u64>, t: Timestamp, mode: Mode) {
@@ -1192,4 +1278,105 @@ fn print_stats(e: &Engine, ports: &BTreeMap<u16, u64>, t: Timestamp, mode: Mode)
         e.source_count(),
         ports
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Result<Args, String> {
+        parse_args_from(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    // THE PROPERTY: absent, the flag changes nothing. `main` builds a forwarder only from
+    // `Some`, and the packet path's one call to it sits under that same `Option`; this is
+    // the pure half of that, and the half a test can reach.
+    #[test]
+    fn without_the_flag_no_collector_is_configured() {
+        let a = args(&[]).unwrap();
+        assert_eq!(a.hep_send, None);
+        assert_eq!(a.hep_agent_id, None);
+        let a = args(&["--ports", "5060", "-v"]).unwrap();
+        assert_eq!(a.hep_send, None, "unrelated flags must not switch it on");
+    }
+
+    #[test]
+    fn the_flag_names_the_collector_and_the_agent_id_is_left_to_the_default() {
+        let a = args(&["--hep-send", "10.0.0.9:9060"]).unwrap();
+        assert_eq!(a.hep_send.as_deref(), Some("10.0.0.9:9060"));
+        assert_eq!(a.hep_agent_id, None);
+    }
+
+    #[test]
+    fn the_agent_id_can_be_chosen() {
+        let a = args(&[
+            "--hep-agent-id",
+            "7",
+            "--hep-send",
+            "collector.example:9060",
+        ])
+        .unwrap();
+        assert_eq!(a.hep_agent_id, Some(7));
+        assert_eq!(a.hep_send.as_deref(), Some("collector.example:9060"));
+    }
+
+    // An id with nothing to send to is a flag the operator believes is doing something.
+    #[test]
+    fn an_agent_id_without_a_collector_is_refused() {
+        let e = args(&["--hep-agent-id", "7"])
+            .err()
+            .expect("must be refused");
+        assert!(
+            e.contains("--hep-send"),
+            "the error must name the missing flag: {e}"
+        );
+    }
+
+    #[test]
+    fn a_collector_without_a_port_is_refused() {
+        let e = args(&["--hep-send", "10.0.0.9"])
+            .err()
+            .expect("must be refused");
+        assert!(
+            e.contains("host:port"),
+            "the error must say the expected shape: {e}"
+        );
+    }
+
+    #[test]
+    fn a_non_numeric_agent_id_is_refused() {
+        let e = args(&["--hep-send", "10.0.0.9:9060", "--hep-agent-id", "seven"])
+            .err()
+            .expect("must be refused");
+        assert!(
+            e.contains("--hep-agent-id"),
+            "the error must name the flag: {e}"
+        );
+    }
+
+    // The checkpoint line is rewritten whole, so with no forwarder the HEP keys are absent
+    // -- not stale from a previous run that had one.
+    #[test]
+    fn the_checkpoint_line_carries_hep_counters_only_when_forwarding() {
+        let s = tfps_core::engine::Stats::default();
+        let plain = counter_line(&s, None);
+        assert!(
+            !plain.contains("hep_"),
+            "no forwarder, no HEP keys: {plain}"
+        );
+        let c = hep::Counters {
+            sent: 5,
+            dropped: 1,
+            failed: 0,
+        };
+        let with = counter_line(&s, Some(c));
+        assert!(
+            with.starts_with(&plain),
+            "the existing counters must not move"
+        );
+        assert!(
+            with.ends_with(" hep_sent=5 hep_dropped=1 hep_failed=0"),
+            "{with}"
+        );
+    }
 }
