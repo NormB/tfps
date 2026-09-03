@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use tfps::condemn::{invalid, lift, place, Judge, Request};
 use tfps::contract::Label;
 use tfps::ctl::{attribute, latest_reasons, status_of, to_banned, to_dropped, Attribution};
 use tfps::drops::proto_name;
@@ -36,8 +37,11 @@ USAGE: tfps_ctl <command> [options]
   banned [--why] [--json]      list condemned sources, with time left
   dropped [--limit N] [--ip IP] [--json]
                                what blocked sources kept sending, and why they were blocked
-  unban <ip>... | --all        lift a block. The precision measure of this product
-  ban <ip> [--ttl N]           condemn a source by hand (default ttl: 3600s, 0 = forever)
+  unban <ip>... | --all [--json]
+                               lift a block. The precision measure of this product
+  ban <ip>... [--ttl N] [--dry-run] [--json]
+                               condemn a source by hand (default ttl: 3600s, 0 = forever).
+                               Refuses this host's addresses and anything in ignoreip
   sources [filters]            list learned sources and the countries they call
   source <peer>                everything known about one source
   peers                        sources by country breadth, when last heard
@@ -53,13 +57,15 @@ SOURCE FILTERS:
 
 GLOBAL:
   --db PATH                    database (default: {db})
+  --config PATH                the daemon's configuration, for its ignoreip (default: {config})
   --map PATH                   an explicitly pinned block map
   --json                       machine output: JSON Lines, every field present, null when unknown
   -h, --help                   this help
 
 Reading blocks needs CAP_BPF (run as root). Reading learned state only needs the database.
 ",
-        db = tfps::store::DEFAULT_PATH
+        db = tfps::store::DEFAULT_PATH,
+        config = tfps::config::DEFAULT_PATH
     )
 }
 
@@ -67,7 +73,9 @@ struct Args {
     command: String,
     positional: Vec<String>,
     db: PathBuf,
+    config: PathBuf,
     json: bool,
+    dry_run: bool,
     map: Option<PathBuf>,
     peer: Option<String>,
     a_number: Option<String>,
@@ -86,7 +94,9 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         command: String::new(),
         positional: Vec::new(),
         db: PathBuf::from(tfps::store::DEFAULT_PATH),
+        config: PathBuf::from(tfps::config::DEFAULT_PATH),
         json: false,
+        dry_run: false,
         map: None,
         peer: None,
         a_number: None,
@@ -106,6 +116,8 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--db" => a.db = PathBuf::from(value("--db", &mut it)?),
+            "--config" => a.config = PathBuf::from(value("--config", &mut it)?),
+            "--dry-run" => a.dry_run = true,
             "--map" => a.map = Some(PathBuf::from(value("--map", &mut it)?)),
             "--peer" => a.peer = Some(value("--peer", &mut it)?),
             "--a" => a.a_number = Some(value("--a", &mut it)?),
@@ -533,82 +545,101 @@ fn dropped(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
-/// Records a lift, but only one that actually happened.
+/// The store, opened for writing so a lift or a block can be recorded.
 ///
-/// Split out because the kernel map needs `CAP_BPF` and cannot be driven from a
-/// test, while the rule that matters here can be: **an address that was not
-/// blocked must leave no trace.** A row for a lift that did not happen is a
-/// negative label against a source nothing was ever alleged about, and R1 reads
-/// these rows as an operator saying the machine was wrong.
-///
-/// Never fatal. The kernel removal is the operator's actual intent and has
-/// already happened by the time this runs; failing the command afterwards would
-/// tell them the unban did not work when it did. Never silent either — this is
-/// the highest-quality label in the corpus and losing one quietly is how the
-/// precision measure rots.
-fn record_lift(store: Option<&Store>, ts: u32, ip: Ipv4Addr, removed: bool) {
-    if !removed {
-        return;
+/// Read-write, unlike every reading command in this tool: these are the two
+/// things `tfps_ctl` does that the corpus needs to know about. Opened
+/// best-effort so a database that cannot be written still lets the operator
+/// act -- protection outranks bookkeeping -- and never silently, because a
+/// lost row here is a label the corpus will never have.
+fn writer(args: &Args) -> Option<Store> {
+    Store::open(&args.db)
+        .map_err(|e| eprintln!("WARNING: this will not be recorded: {e}"))
+        .ok()
+}
+
+/// One outcome, in whichever dialect was asked for.
+fn report(args: &Args, o: &tfps::condemn::Outcome) -> Result<(), String> {
+    if args.json {
+        say!("{}", json_line(&o.action)?);
+    } else {
+        say!("{}", o.describe());
     }
-    let Some(s) = store else {
-        return;
-    };
-    if let Err(e) = s.log_unban(ts, ip, "operator") {
-        eprintln!("WARNING: {ip} was unbanned but the lift was not recorded: {e}");
-    }
+    Ok(())
 }
 
 fn unban(args: &Args) -> Result<(), String> {
     let mut b = Blocklist::open(args.map.as_deref())?;
-    // Read-write here, unlike every other command in this tool: an unban is the
-    // one thing `tfps_ctl` does that the corpus needs to know about. Opened
-    // best-effort so a database that cannot be written still lets the operator
-    // lift a block — protection outranks bookkeeping.
-    let store = Store::open(&args.db)
-        .map_err(|e| eprintln!("WARNING: lifts will not be recorded: {e}"))
-        .ok();
+    let store = writer(args);
     let ts = now();
     if args.all {
         let all = b.entries();
         for (ip, _) in &all {
-            b.remove(*ip)?;
-            record_lift(store.as_ref(), ts, *ip, true);
+            let o = lift(&mut b, store.as_ref(), *ip, ts)?;
+            if args.json {
+                report(args, &o)?;
+            }
         }
-        say!("unbanned {} sources", all.len());
+        if !args.json {
+            say!("unbanned {} sources", all.len());
+        }
         return Ok(());
     }
     if args.positional.is_empty() {
         return Err("give at least one address, or --all".into());
     }
+    let mut refused = 0usize;
     for raw in &args.positional {
-        let ip: Ipv4Addr = raw.parse().map_err(|e| format!("{raw}: {e}"))?;
         // Saying "unbanned" for an address that was never there would be a small lie the
         // operator acts on: they would stop looking for the real block.
-        let removed = b.remove(ip)?;
-        if removed {
-            say!("unbanned {ip}");
-        } else {
-            say!("{ip} was not blocked");
-        }
-        record_lift(store.as_ref(), ts, ip, removed);
+        let o = match raw.parse::<Ipv4Addr>() {
+            Ok(ip) => lift(&mut b, store.as_ref(), ip, ts)?,
+            Err(_) => invalid("unban", "operator"),
+        };
+        refused += usize::from(o.refusal.is_some());
+        report(args, &o)?;
+    }
+    if refused > 0 {
+        return Err(format!("{refused} of {} not lifted", args.positional.len()));
     }
     Ok(())
 }
 
+/// Condemn by hand, through the same rule the daemon applies to itself: never
+/// this host, never an `ignoreip` address, and always an audit row -- rule
+/// `manual`, detail `operator` -- so the label export says who asked.
 fn ban(args: &Args) -> Result<(), String> {
-    let mut b = Blocklist::open(args.map.as_deref())?;
     if args.positional.is_empty() {
         return Err("give at least one address".into());
     }
+    let mut b = Blocklist::open(args.map.as_deref())?;
+    let store = writer(args);
+    let mut judge = Judge::load(tfps::xdp::local_addresses(), store.as_ref(), &args.config);
+    let ts = now();
+    let mut refused = 0usize;
     for raw in &args.positional {
-        let ip: Ipv4Addr = raw.parse().map_err(|e| format!("{raw}: {e}"))?;
-        b.insert(ip, args.ttl)?;
-        let how = if args.ttl == 0 {
-            "with no expiry".to_string()
-        } else {
-            format!("for {}", ago(args.ttl as u32))
+        let o = match raw.parse::<Ipv4Addr>() {
+            Ok(ip) => place(
+                &mut b,
+                store.as_ref(),
+                &mut judge,
+                &Request {
+                    ip,
+                    ttl: args.ttl,
+                    rule: "manual",
+                    detail: "operator",
+                    source: "operator",
+                },
+                ts,
+                args.dry_run,
+            )?,
+            Err(_) => invalid("ban", "operator"),
         };
-        say!("blocked {ip} {how}");
+        refused += usize::from(o.refusal.is_some());
+        report(args, &o)?;
+    }
+    if refused > 0 {
+        return Err(format!("{refused} of {} refused", args.positional.len()));
     }
     Ok(())
 }
@@ -824,66 +855,11 @@ fn ago(secs: u32) -> String {
 mod tests {
     use super::*;
 
-    // ---- R1: the gold negative ----
-
     fn ctl_db(name: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("tfps-ctl-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d.join("tfps.db")
-    }
-
-    fn lifts(s: &Store) -> Vec<tfps::store::UnbanRow> {
-        s.unbans(100).unwrap()
-    }
-
-    #[test]
-    fn a_real_lift_is_recorded_as_an_operator_judgement() {
-        let path = ctl_db("lift");
-        let s = Store::open(&path).unwrap();
-        record_lift(Some(&s), 500, "198.51.100.1".parse().unwrap(), true);
-        let rows = lifts(&s);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].ip, "198.51.100.1");
-        assert_eq!(
-            rows[0].actor, "operator",
-            "the actor must distinguish a human lift from a TTL lapsing"
-        );
-    }
-
-    // THE RULE. `unban` on an address that was never blocked prints "was not
-    // blocked" and must write nothing: a row here would be a negative label
-    // against a source nothing was ever alleged about, and R1 counts these as
-    // an operator saying the machine was wrong.
-    #[test]
-    fn lifting_an_address_that_was_not_blocked_records_nothing() {
-        let path = ctl_db("no-lift");
-        let s = Store::open(&path).unwrap();
-        record_lift(Some(&s), 500, "198.51.100.2".parse().unwrap(), false);
-        assert!(
-            lifts(&s).is_empty(),
-            "a lift that did not happen must leave no trace"
-        );
-    }
-
-    // Bookkeeping must never be able to stop the operator lifting a block, so a
-    // missing store is not an error here -- but it must also not panic, which is
-    // what an unwrap on the open would have done on a read-only filesystem.
-    #[test]
-    fn a_lift_without_a_database_still_completes() {
-        record_lift(None, 500, "198.51.100.3".parse().unwrap(), true);
-    }
-
-    // NEGATIVE CONTROL for the pair above: with a store present and `removed`
-    // true, exactly one row appears -- so "records nothing" is not passing
-    // because nothing is ever recorded.
-    #[test]
-    fn recording_is_reachable_so_the_silence_tests_are_not_vacuous() {
-        let path = ctl_db("reachable");
-        let s = Store::open(&path).unwrap();
-        record_lift(Some(&s), 1, "198.51.100.4".parse().unwrap(), true);
-        record_lift(Some(&s), 2, "198.51.100.5".parse().unwrap(), false);
-        assert_eq!(lifts(&s).len(), 1, "exactly the real lift, and only it");
     }
 
     fn args(v: &[&str]) -> Result<Args, String> {

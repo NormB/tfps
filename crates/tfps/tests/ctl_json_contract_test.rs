@@ -22,11 +22,13 @@ use std::net::Ipv4Addr;
 use std::path::Path;
 
 use serde::{de::DeserializeOwned, Serialize};
+use tfps::condemn::{invalid, lift, place, Judge, MemoryMap, Request};
 use tfps::contract::{Action, Banned, Dropped, Label, Status};
 use tfps::ctl::{attribute, latest_reasons, status_of, to_banned, to_dropped};
 use tfps::drops::DropRow;
 use tfps::store::Store;
 use tfps_core::disposition::Disposition;
+use tfps_core::ignore::IgnoreList;
 
 const STATUS: &str = include_str!("fixtures/tfps-status-golden.json");
 const BANNED: &str = include_str!("fixtures/tfps-banned-golden.jsonl");
@@ -287,4 +289,134 @@ fn dropped_is_produced_from_the_drop_log_and_the_audit_log() {
         .map(|r| emit(&to_dropped(r, &attribute(&audit, &apiban, &r.ip))))
         .collect();
     assert_eq!(got, lines(DROPPED));
+}
+
+/// The host is 192.0.2.1 and 192.0.2.64/26 is exempt: the two refusals the
+/// fixture shows are refusals of exactly these.
+fn judge() -> Judge {
+    let mut ignore = IgnoreList::new();
+    ignore.add("192.0.2.64/26").unwrap();
+    Judge::new(vec![ip("192.0.2.1")], ignore)
+}
+
+/// 2026-09-03T16:40:10Z: when the operator ran the command.
+const T_BAN: u32 = T0 + 10;
+
+#[test]
+fn ban_is_produced_from_the_one_placement_rule() {
+    let s = fresh("ban");
+    let mut map = MemoryMap::default();
+    let mut j = judge();
+    let req = |addr: &str, ttl: u64| Request {
+        ip: ip(addr),
+        ttl,
+        rule: "manual",
+        detail: "operator",
+        source: "operator",
+    };
+    let got = vec![
+        emit(
+            &place(
+                &mut map,
+                Some(&s),
+                &mut j,
+                &req("198.51.100.20", 3600),
+                T_BAN,
+                false,
+            )
+            .unwrap()
+            .action,
+        ),
+        emit(
+            &place(
+                &mut map,
+                Some(&s),
+                &mut j,
+                &req("198.51.100.23", 0),
+                T_BAN,
+                false,
+            )
+            .unwrap()
+            .action,
+        ),
+        emit(
+            &place(
+                &mut map,
+                Some(&s),
+                &mut j,
+                &req("192.0.2.1", 3600),
+                T_BAN,
+                false,
+            )
+            .unwrap()
+            .action,
+        ),
+        emit(
+            &place(
+                &mut map,
+                Some(&s),
+                &mut j,
+                &req("192.0.2.77", 3600),
+                T_BAN,
+                false,
+            )
+            .unwrap()
+            .action,
+        ),
+        emit(&invalid("ban", "operator").action),
+    ];
+    assert_eq!(got, lines(BAN));
+    // What the fixture cannot show: the two applied blocks are in the map and
+    // the audit log, and nothing else is.
+    assert_eq!(
+        map.blocked
+            .keys()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["198.51.100.20", "198.51.100.23"]
+    );
+    let rows = s.blocks(10, None).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows
+        .iter()
+        .all(|r| r.reason == "manual" && r.detail == "operator"));
+}
+
+#[test]
+fn unban_is_produced_from_the_one_lifting_rule() {
+    let s = fresh("unban");
+    let mut map = MemoryMap::default();
+    place(
+        &mut map,
+        Some(&s),
+        &mut judge(),
+        &Request {
+            ip: ip("198.51.100.20"),
+            ttl: 3600,
+            rule: "manual",
+            detail: "operator",
+            source: "operator",
+        },
+        T0,
+        false,
+    )
+    .unwrap();
+    let got = vec![
+        emit(
+            &lift(&mut map, Some(&s), ip("198.51.100.20"), T_BAN)
+                .unwrap()
+                .action,
+        ),
+        emit(
+            &lift(&mut map, Some(&s), ip("198.51.100.21"), T_BAN)
+                .unwrap()
+                .action,
+        ),
+        emit(&invalid("unban", "operator").action),
+    ];
+    assert_eq!(got, lines(UNBAN));
+    assert!(map.blocked.is_empty());
+    let lifts = s.unbans(10).unwrap();
+    assert_eq!(lifts.len(), 1, "only the lift that happened is recorded");
+    assert_eq!(lifts[0].ip, "198.51.100.20");
 }

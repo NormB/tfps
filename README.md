@@ -417,8 +417,10 @@ tfps_ctl stats                        every counter: kernel drops, traffic mix, 
 tfps_ctl banned [--why] [--json]      condemned sources, with time left and the reason
 tfps_ctl dropped [--limit N] [--ip IP] [--json]
                                       what blocked sources kept sending, and why they were blocked
-tfps_ctl unban <ip>... | --all        lift a block — takes effect on the next packet
-tfps_ctl ban <ip> [--ttl N]           condemn by hand (default 3600s, 0 = no expiry)
+tfps_ctl unban <ip>... | --all [--json]
+                                      lift a block — takes effect on the next packet
+tfps_ctl ban <ip>... [--ttl N] [--dry-run] [--json]
+                                      condemn by hand (default 3600s, 0 = no expiry)
 tfps_ctl sources [--peer --country]   learned sources and the countries they call
 tfps_ctl source <peer>                everything known about one source
 tfps_ctl peers                        sources by country breadth, when last heard
@@ -433,8 +435,18 @@ value" from "field missing". `status --json` is one object; `banned --json`, `dr
 --json` and `log --json` are one line per record, and `log --json` is every label unless
 you say `--limit`. The shapes are pinned by golden fixtures under
 `crates/tfps/tests/fixtures/` (`tfps-status-golden.json`, `tfps-banned-golden.jsonl`,
-`tfps-dropped-golden.jsonl`, `tfps-labels-golden.jsonl`), which sipnab holds byte for
-byte: a change here that the fixture does not carry fails the build on both sides.
+`tfps-dropped-golden.jsonl`, `tfps-ban-golden.jsonl`, `tfps-unban-golden.jsonl`,
+`tfps-labels-golden.jsonl`), which sipnab holds byte for byte: a change here that the
+fixture does not carry fails the build on both sides.
+
+`ban` goes through the same rule the daemon applies to itself. It **refuses** this host's
+own addresses and anything in `ignoreip` — read from the daemon's configuration file
+(`--config`) and from the list the daemon writes at checkpoint, so a `--ignoreip` given
+on its command line counts too — and it records every block it places in the audit log
+as rule `manual`, detail `operator`, so `banned --why`, `dropped` and the label export
+all know who asked. `--dry-run` reports what would happen and writes nothing. With
+`--json` each address is one line: `{"ip","action","applied","refused","expires","source"}`,
+where `refused` is `self`, `ignoreip`, `not-blocked`, `invalid` or `null`.
 
 ```console
 # tfps_ctl status --json
@@ -502,7 +514,9 @@ events are sampled — the first four drops from each source in every second —
 carries the source's running count and the daemon reads the kernel's per-source totals
 again at every report and checkpoint, so the numbers are exact even for a source that
 stopped between two events. A source blocked by hand
-with `tfps_ctl ban` is printed as `reason=unrecorded`, because the daemon did not place it.
+with `tfps_ctl ban` is printed as `reason=unrecorded` in the daemon's own `DROPPED` line,
+because the daemon did not place it; `tfps_ctl dropped` and `banned --why` find it in the
+audit log as `manual (operator)`.
 Under another product's shared drop map there is no ring buffer, and the startup banner
 says `dropped traffic : NOT observable` rather than reporting nothing.
 
