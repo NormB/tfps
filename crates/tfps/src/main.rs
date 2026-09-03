@@ -74,6 +74,10 @@ struct Args {
     hep_send: Option<String>,
     /// The capture agent ID in each HEP packet; `None` takes the module's default.
     hep_agent_id: Option<u32>,
+    /// The file holding the shared secret the collector expects; `None` sends plain HEP.
+    hep_auth_file: Option<PathBuf>,
+    /// How the secret is presented. Only read when a file is named.
+    hep_auth_mode: hep::AuthMode,
 }
 
 impl Default for Args {
@@ -107,6 +111,8 @@ impl Default for Args {
             given: std::collections::HashSet::new(),
             hep_send: None,
             hep_agent_id: None,
+            hep_auth_file: None,
+            hep_auth_mode: hep::AuthMode::Hmac,
         }
     }
 }
@@ -139,6 +145,9 @@ USAGE: tfps [options]
       --config PATH        configuration               (default: /etc/tfps/config.json)
       --hep-send HOST:PORT send a HEP v3 copy of every SIP message to this UDP collector
       --hep-agent-id N     capture agent id in each HEP packet (default: 2033)
+      --hep-auth-file PATH the shared secret the collector expects (refused if world-readable)
+      --hep-auth-mode M    plain (the key verbatim, Homer-style) or hmac (a signed per-message
+                           token, sipnab-to-sipnab; default)
   -h, --help               this help
 
 Capture is AF_PACKET; it opens no UDP socket and does not clash with the softswitch.
@@ -223,6 +232,13 @@ fn parse_args_from(argv: &[String]) -> Result<Args, String> {
                         .map_err(|e| format!("--hep-agent-id: {e}"))?,
                 );
             }
+            "--hep-auth-file" => a.hep_auth_file = Some(PathBuf::from(next("--hep-auth-file")?)),
+            "--hep-auth-mode" => {
+                a.hep_auth_mode = next("--hep-auth-mode")?
+                    .parse()
+                    .map_err(|e| format!("--hep-auth-mode: {e}"))?;
+                a.given.insert("--hep-auth-mode".into());
+            }
             other => return Err(format!("unknown option: {other}")),
         }
     }
@@ -232,6 +248,13 @@ fn parse_args_from(argv: &[String]) -> Result<Args, String> {
     // An id with nowhere to send is a flag the operator believes is doing something.
     if a.hep_agent_id.is_some() && a.hep_send.is_none() {
         return Err("--hep-agent-id has no effect without --hep-send".into());
+    }
+    if a.hep_auth_file.is_some() && a.hep_send.is_none() {
+        return Err("--hep-auth-file has no effect without --hep-send".into());
+    }
+    // A mode with no secret is a flag the operator believes is doing something.
+    if a.given.contains("--hep-auth-mode") && a.hep_auth_file.is_none() {
+        return Err("--hep-auth-mode has no effect without --hep-auth-file".into());
     }
     Ok(a)
 }
@@ -593,9 +616,32 @@ fn main() -> ExitCode {
         None => None,
         Some(target) => {
             let agent = args.hep_agent_id.unwrap_or(hep::DEFAULT_AGENT_ID);
-            match hep::Forwarder::start(target, agent) {
+            // The secret, when there is one. Refusing a file the world can read is
+            // the point: a stream the operator believes is authenticated, and that
+            // any local user could sign into, is worse than one they know is open.
+            let auth = match &args.hep_auth_file {
+                None => None,
+                Some(path) => match hep::read_secret(path) {
+                    Ok(key) => Some(hep::Auth {
+                        key,
+                        mode: args.hep_auth_mode,
+                    }),
+                    Err(e) => {
+                        eprintln!("error: --hep-auth-file {e}");
+                        return ExitCode::from(2);
+                    }
+                },
+            };
+            match hep::Forwarder::start(target, agent, auth) {
                 Ok((f, addr)) => {
-                    say!("  HEP forwarding    : every SIP message to {addr} (agent id {agent})");
+                    let how = match f.auth_mode() {
+                        None => "unauthenticated",
+                        Some(hep::AuthMode::Plain) => "plain shared key",
+                        Some(hep::AuthMode::Hmac) => "HMAC-signed tokens",
+                    };
+                    say!(
+                        "  HEP forwarding    : every SIP message to {addr} (agent id {agent}, {how})"
+                    );
                     Some((f, addr))
                 }
                 // The operator asked for it by name; starting without it would be the
@@ -1363,6 +1409,76 @@ mod tests {
             e.contains("--hep-agent-id"),
             "the error must name the flag: {e}"
         );
+    }
+
+    // ---- authenticated forwarding ----
+
+    #[test]
+    fn a_secret_file_selects_hmac_unless_plain_is_asked_for() {
+        let a = args(&[
+            "--hep-send",
+            "10.0.0.9:9060",
+            "--hep-auth-file",
+            "/etc/tfps/hep.key",
+        ])
+        .unwrap();
+        assert_eq!(
+            a.hep_auth_file.as_deref(),
+            Some(std::path::Path::new("/etc/tfps/hep.key"))
+        );
+        assert_eq!(
+            a.hep_auth_mode,
+            hep::AuthMode::Hmac,
+            "the replay-resistant mode is the default; the weaker one must be named"
+        );
+        let a = args(&[
+            "--hep-send",
+            "10.0.0.9:9060",
+            "--hep-auth-file",
+            "/etc/tfps/hep.key",
+            "--hep-auth-mode",
+            "plain",
+        ])
+        .unwrap();
+        assert_eq!(a.hep_auth_mode, hep::AuthMode::Plain);
+    }
+
+    #[test]
+    fn without_a_secret_file_nothing_is_authenticated() {
+        let a = args(&["--hep-send", "10.0.0.9:9060"]).unwrap();
+        assert_eq!(a.hep_auth_file, None);
+    }
+
+    // A mode with no secret is a flag the operator believes is doing something.
+    #[test]
+    fn an_auth_mode_without_a_secret_file_is_refused() {
+        let e = args(&["--hep-send", "10.0.0.9:9060", "--hep-auth-mode", "hmac"])
+            .err()
+            .expect("must be refused");
+        assert!(e.contains("--hep-auth-file"), "{e}");
+    }
+
+    #[test]
+    fn a_secret_file_without_a_collector_is_refused() {
+        let e = args(&["--hep-auth-file", "/etc/tfps/hep.key"])
+            .err()
+            .expect("must be refused");
+        assert!(e.contains("--hep-send"), "{e}");
+    }
+
+    #[test]
+    fn an_unknown_auth_mode_is_refused_by_name() {
+        let e = args(&[
+            "--hep-send",
+            "10.0.0.9:9060",
+            "--hep-auth-file",
+            "/k",
+            "--hep-auth-mode",
+            "md5",
+        ])
+        .err()
+        .expect("must be refused");
+        assert!(e.contains("--hep-auth-mode") && e.contains("md5"), "{e}");
     }
 
     // The checkpoint line is rewritten whole, so with no forwarder the HEP keys are absent

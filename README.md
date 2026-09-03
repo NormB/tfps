@@ -402,6 +402,8 @@ why).
 | `--db PATH` / `--no-db` | SQLite database, or run without persistence |
 | `--hep-send HOST:PORT` | send a HEP v3 copy of every SIP message to an external UDP collector |
 | `--hep-agent-id N` | the capture agent id in each HEP packet (default `2033`) |
+| `--hep-auth-file PATH` | the shared secret the collector expects; a world-readable file is refused |
+| `--hep-auth-mode plain\|hmac` | how the secret travels: `hmac` (default) signs every packet with a per-message token the collector verifies and cannot be replayed; `plain` sends the key verbatim, which a stock Homer expects |
 | `-v` / `--debug-unparsed` | verbose; show payloads that failed to parse |
 
 ---
