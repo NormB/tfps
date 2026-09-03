@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tfps::condemn::{invalid, lift, place, Judge, Request};
+use tfps::condemn::{invalid, lift, place, Intake, Judge, Request};
 use tfps::contract::Label;
 use tfps::ctl::{attribute, latest_reasons, status_of, to_banned, to_dropped, Attribution};
 use tfps::drops::proto_name;
@@ -46,6 +46,9 @@ USAGE: tfps_ctl <command> [options]
   source <peer>                everything known about one source
   peers                        sources by country breadth, when last heard
   countries <peer>             the countries a source has been seen to call
+  ingest [--ttl N] [--dry-run] apply findings from sipnab, JSON Lines on stdin, one
+                               ban-shaped JSON line out per finding (never bans by itself:
+                               same refusals, TTL and audit row as `ban`)
   log [--limit N] [--ip IP]    the block audit log, newest first
   log --json [--limit N]       every label as JSON Lines, for an external analyzer
   forget <peer> [--a NUMBER]   erase learned state (requires tfps stopped)
@@ -193,6 +196,7 @@ fn main() -> ExitCode {
         "peers" => peers(&args),
         "countries" => countries(&args),
         "log" => log(&args),
+        "ingest" => ingest(&args),
         "forget" => forget(&args),
         other => Err(format!("unknown command: {other}")),
     };
@@ -641,6 +645,53 @@ fn ban(args: &Args) -> Result<(), String> {
     if refused > 0 {
         return Err(format!("{refused} of {} refused", args.positional.len()));
     }
+    Ok(())
+}
+
+/// R4: sipnab publishes evidence; this system decides what to do with it.
+///
+/// One finding per line on stdin, `{"src_ip","rule","evidence","ts"}`, and one
+/// `Action` line out per finding, in order, as each is decided -- so a pipe
+/// from a running sipnab acts on a finding when it arrives. Every finding is
+/// applied exactly as `ban` applies an address: the host and `ignoreip` are
+/// refused, the TTL is the same, and the audit row carries `sipnab:<rule>`
+/// with the evidence as its detail, so a label exported later says who asked
+/// and why. A line that is not a finding is reported on its own line as
+/// `invalid` and the stream goes on.
+fn ingest(args: &Args) -> Result<(), String> {
+    if !args.positional.is_empty() {
+        return Err("ingest reads findings from stdin and takes no address".into());
+    }
+    let mut b = Blocklist::open(args.map.as_deref())?;
+    let store = writer(args);
+    let mut judge = Judge::load(tfps::xdp::local_addresses(), store.as_ref(), &args.config);
+    let (mut applied, mut refused, mut invalid_lines) = (0usize, 0usize, 0usize);
+    let n = Intake {
+        sink: &mut b,
+        store: store.as_ref(),
+        judge: &mut judge,
+        ttl: args.ttl,
+        dry_run: args.dry_run,
+    }
+    .stream(std::io::stdin().lock(), &now, &mut |o| {
+        match (&o.refusal, o.action.applied) {
+            (Some(tfps::condemn::Refusal::Invalid), _) => invalid_lines += 1,
+            (Some(_), _) => refused += 1,
+            (None, true) => applied += 1,
+            (None, false) => {}
+        }
+        say!("{}", json_line(&o.action)?);
+        Ok(())
+    })?;
+    // For the person watching the pipe; the stream above is for the program.
+    eprintln!(
+        "ingested {n} findings: {applied} applied, {refused} refused, {invalid_lines} invalid{}",
+        if args.dry_run {
+            " (dry run: nothing written)"
+        } else {
+            ""
+        }
+    );
     Ok(())
 }
 

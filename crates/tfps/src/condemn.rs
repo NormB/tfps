@@ -15,8 +15,11 @@
 
 #![deny(missing_docs)]
 
+use std::io::BufRead;
 use std::net::Ipv4Addr;
 use std::path::Path;
+
+use serde::{Deserialize, Serialize};
 
 use tfps_core::disposition::Disposition;
 use tfps_core::ignore::IgnoreList;
@@ -302,6 +305,120 @@ pub fn invalid(action: &str, source: &str) -> Outcome {
             source: source.to_string(),
         },
         refusal: Some(Refusal::Invalid),
+    }
+}
+
+// ---------------------------------------------------------------- R4: evidence in
+
+/// One finding, as sipnab publishes it: the same `{src_ip, rule, evidence}`
+/// that `--alert-exec` already hands a shell command, one JSON object per line.
+///
+/// `ts` is when sipnab saw it and is carried for the operator's eyes. The
+/// audit row is stamped with the ingest time, because that is when THIS
+/// system reached its decision (R1, `first_seen`). Fields this version does
+/// not know are ignored, so a newer sipnab can say more without breaking an
+/// older TFPS.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Finding {
+    /// The source sipnab is presenting evidence against.
+    pub src_ip: String,
+    /// sipnab's rule name; becomes `sipnab:<rule>` in the audit log.
+    pub rule: String,
+    /// What sipnab saw; becomes the audit `detail`, verbatim.
+    pub evidence: String,
+    /// When sipnab saw it, RFC 3339, if it said. (serde reads an absent
+    /// `Option` as `None` on its own; the attribute only keeps it absent on
+    /// the way back out, so the fixture round-trips.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ts: Option<String>,
+}
+
+/// The audit `rule` for a finding: the provenance, then sipnab's own name.
+pub fn provenance(rule: &str) -> String {
+    format!("sipnab:{rule}")
+}
+
+/// Everything a stream of evidence needs, held once for every line of it.
+pub struct Intake<'a> {
+    /// The kernel map, or a test's fake.
+    pub sink: &'a mut dyn BanSink,
+    /// The audit log, when one could be opened.
+    pub store: Option<&'a Store>,
+    /// The daemon's exemptions.
+    pub judge: &'a mut Judge,
+    /// Seconds a block lasts; `0` is forever.
+    pub ttl: u64,
+    /// Report every decision, write nothing.
+    pub dry_run: bool,
+}
+
+impl Intake<'_> {
+    /// Applies one line of evidence exactly as `ban` would apply the address.
+    ///
+    /// A line that is not a finding -- torn JSON, no `src_ip`, an address
+    /// that is not IPv4 -- is an `invalid` outcome for THAT line, with the
+    /// reason on stderr, and never an error: a stream is a stream, and one
+    /// torn record must not stop the ones after it.
+    pub fn line(&mut self, line: &str, now: u32) -> Result<Outcome, String> {
+        let finding: Finding = match serde_json::from_str(line) {
+            Ok(f) => f,
+            Err(e) => {
+                // The error, not the line: a torn record can be anything, and
+                // stderr is the operator's, not the stream's.
+                eprintln!(
+                    "WARNING: a line of evidence is not a finding ({e}); reported as invalid"
+                );
+                return Ok(invalid("ban", "sipnab"));
+            }
+        };
+        let Ok(ip) = finding.src_ip.parse::<Ipv4Addr>() else {
+            eprintln!(
+                "WARNING: a finding names no IPv4 address ({:?}); reported as invalid",
+                finding.src_ip
+            );
+            return Ok(invalid("ban", "sipnab"));
+        };
+        let rule = provenance(&finding.rule);
+        place(
+            self.sink,
+            self.store,
+            self.judge,
+            &Request {
+                ip,
+                ttl: self.ttl,
+                rule: &rule,
+                detail: &finding.evidence,
+                source: "sipnab",
+            },
+            now,
+            self.dry_run,
+        )
+    }
+
+    /// Reads findings until the input ends, handing each outcome to `emit` as
+    /// it is decided, so a long-lived pipe from sipnab acts on every finding
+    /// when it arrives rather than when the pipe closes. Blank lines are not
+    /// records and produce nothing. Returns how many findings were read.
+    ///
+    /// Only a failed read of the input or a refused kernel write ends it
+    /// early; both are about this side, not about a line.
+    pub fn stream<R: BufRead>(
+        &mut self,
+        input: R,
+        now: &dyn Fn() -> u32,
+        emit: &mut dyn FnMut(&Outcome) -> Result<(), String>,
+    ) -> Result<usize, String> {
+        let mut n = 0usize;
+        for line in input.lines() {
+            let line = line.map_err(|e| format!("reading evidence: {e}"))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            n += 1;
+            let o = self.line(&line, now())?;
+            emit(&o)?;
+        }
+        Ok(n)
     }
 }
 
@@ -737,5 +854,262 @@ mod tests {
         assert_eq!(a.refused.as_deref(), Some("invalid"));
         assert!(!a.applied);
         assert_eq!((a.action.as_str(), a.source.as_str()), ("ban", "sipnab"));
+    }
+
+    // ---- R4: evidence from sipnab, applied as a ban is applied ----
+    //
+    // sipnab never bans anything; it publishes evidence, and a system whose
+    // entire job is condemning sources decides what to do with it. So a
+    // finding goes through the same refusals as `ban`, gets the same TTL, and
+    // leaves an audit row that says where it came from.
+
+    const T_INGEST: u32 = 1_788_453_610;
+
+    fn ingest_one(line: &str, s: &Store, map: &mut MemoryMap, dry: bool) -> Outcome {
+        Intake {
+            sink: map,
+            store: Some(s),
+            judge: &mut judge(),
+            ttl: 3600,
+            dry_run: dry,
+        }
+        .line(line, T_INGEST)
+        .unwrap()
+    }
+
+    #[test]
+    fn a_finding_is_applied_and_audited_with_its_provenance() {
+        let s = store("ingest-applied");
+        let mut map = MemoryMap::default();
+        let o = ingest_one(
+            r#"{"src_ip":"198.51.100.20","rule":"scanner_detected","evidence":"ua=\"pplsip\" detection=ua_pattern","ts":"2026-09-03T16:40:00Z"}"#,
+            &s,
+            &mut map,
+            false,
+        );
+        assert!(o.action.applied);
+        assert_eq!(o.action.source, "sipnab");
+        assert_eq!(o.action.expires.as_deref(), Some("2026-09-03T17:40:10Z"));
+        assert_eq!(map.blocked.get(&ip("198.51.100.20")), Some(&3600));
+        let rows = block_rows(&s);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].reason, "sipnab:scanner_detected");
+        assert_eq!(rows[0].detail, "ua=\"pplsip\" detection=ua_pattern");
+        assert_eq!(
+            rows[0].ts, T_INGEST,
+            "stamped when THIS system decided, not when sipnab saw it"
+        );
+        assert_eq!(s.labels(10).unwrap()[0].rule, "sipnab:scanner_detected");
+    }
+
+    #[test]
+    fn a_finding_naming_the_host_is_refused_with_self() {
+        let s = store("ingest-self");
+        let mut map = MemoryMap::default();
+        let o = ingest_one(
+            r#"{"src_ip":"192.0.2.1","rule":"scanner_detected","evidence":"x"}"#,
+            &s,
+            &mut map,
+            false,
+        );
+        assert_eq!(o.action.refused.as_deref(), Some("self"));
+        assert!(map.blocked.is_empty());
+        assert!(block_rows(&s).is_empty());
+    }
+
+    #[test]
+    fn a_finding_in_ignoreip_is_refused_with_ignoreip() {
+        let s = store("ingest-ignoreip");
+        let mut map = MemoryMap::default();
+        let o = ingest_one(
+            r#"{"src_ip":"192.0.2.77","rule":"register_scan","evidence":"registers=40 success=0"}"#,
+            &s,
+            &mut map,
+            false,
+        );
+        assert_eq!(o.action.refused.as_deref(), Some("ignoreip"));
+        assert_eq!(o.refusal, Some(Refusal::IgnoreIp("192.0.2.64/26".into())));
+        assert!(map.blocked.is_empty());
+    }
+
+    // Proved with a count before and after, and an empty map.
+    #[test]
+    fn a_dry_run_ingest_writes_nothing_and_still_reports() {
+        let s = store("ingest-dry");
+        let before = block_rows(&s).len();
+        let mut map = MemoryMap::default();
+        let o = ingest_one(
+            r#"{"src_ip":"198.51.100.22","rule":"options_flood","evidence":"rate=120/s"}"#,
+            &s,
+            &mut map,
+            true,
+        );
+        assert!(!o.action.applied);
+        assert_eq!(o.action.refused, None);
+        assert_eq!(o.action.expires.as_deref(), Some("2026-09-03T17:40:10Z"));
+        assert!(map.blocked.is_empty(), "the map must be untouched");
+        assert_eq!(
+            block_rows(&s).len(),
+            before,
+            "the audit log must be untouched"
+        );
+    }
+
+    // The binary drives the STREAM, not the line, so the dry run has to be
+    // proved there too: a stream that forgot to pass the flag along would
+    // pass every line-level test and write on a real pipe. Found by mutation.
+    #[test]
+    fn a_dry_run_stream_writes_nothing_and_reports_every_line() {
+        let s = store("ingest-dry-stream");
+        let before = block_rows(&s).len();
+        let mut map = MemoryMap::default();
+        let input = "{\"src_ip\":\"198.51.100.20\",\"rule\":\"a\",\"evidence\":\"1\"}\n\
+                     {\"src_ip\":\"192.0.2.1\",\"rule\":\"a\",\"evidence\":\"2\"}\n";
+        let mut seen = Vec::new();
+        let n = Intake {
+            sink: &mut map,
+            store: Some(&s),
+            judge: &mut judge(),
+            ttl: 60,
+            dry_run: true,
+        }
+        .stream(input.as_bytes(), &|| T_INGEST, &mut |o| {
+            seen.push(o.action.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(n, 2);
+        assert!(!seen[0].applied);
+        assert_eq!(seen[0].refused, None, "would have been applied");
+        assert_eq!(seen[0].expires.as_deref(), Some("2026-09-03T16:41:10Z"));
+        assert_eq!(
+            seen[1].refused.as_deref(),
+            Some("self"),
+            "a refusal is still a refusal"
+        );
+        assert!(map.blocked.is_empty(), "the map must be untouched");
+        assert_eq!(
+            block_rows(&s).len(),
+            before,
+            "the audit log must be untouched"
+        );
+    }
+
+    #[test]
+    fn a_line_that_is_not_a_finding_is_invalid_and_not_an_error() {
+        let s = store("ingest-invalid");
+        let mut map = MemoryMap::default();
+        for bad in [
+            r#"{"src_ip":"198.51.100.21","rule":"reg"#,
+            r#"{"rule":"x","evidence":"y"}"#,
+            r#"{"src_ip":"not-an-ip","rule":"x","evidence":"y"}"#,
+            r#"{"src_ip":"2001:db8::1","rule":"x","evidence":"y"}"#,
+            r#"{"src_ip":"198.51.100.1","rule":"x"}"#,
+            "[1,2,3]",
+            "garbage",
+        ] {
+            let o = ingest_one(bad, &s, &mut map, false);
+            assert_eq!(o.action.refused.as_deref(), Some("invalid"), "{bad}");
+            assert_eq!(o.action.ip, None, "{bad}");
+            assert_eq!(o.action.source, "sipnab");
+        }
+        assert!(map.blocked.is_empty());
+        assert!(block_rows(&s).is_empty());
+    }
+
+    #[test]
+    fn a_newer_sipnab_may_say_more_and_ts_is_optional() {
+        let s = store("ingest-lenient");
+        let mut map = MemoryMap::default();
+        let o = ingest_one(
+            r#"{"src_ip":"198.51.100.30","rule":"x","evidence":"y","confidence":0.9,"call_id":"abc"}"#,
+            &s,
+            &mut map,
+            false,
+        );
+        assert!(
+            o.action.applied,
+            "unknown fields are not a reason to refuse"
+        );
+    }
+
+    // THE STREAM PROPERTY: a torn line in the middle is reported on its own
+    // line and the lines after it are still applied.
+    #[test]
+    fn a_torn_line_does_not_stop_the_lines_after_it() {
+        let s = store("ingest-torn");
+        let mut map = MemoryMap::default();
+        let input = concat!(
+            "{\"src_ip\":\"198.51.100.20\",\"rule\":\"a\",\"evidence\":\"1\"}\n",
+            "\n",
+            "{\"src_ip\":\"198.51.100.21\",\"rule\":\"b",
+            "\n",
+            "{\"src_ip\":\"198.51.100.22\",\"rule\":\"c\",\"evidence\":\"3\"}\n",
+        );
+        let mut seen = Vec::new();
+        let n = Intake {
+            sink: &mut map,
+            store: Some(&s),
+            judge: &mut judge(),
+            ttl: 60,
+            dry_run: false,
+        }
+        .stream(input.as_bytes(), &|| T_INGEST, &mut |o| {
+            seen.push(o.action.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(n, 3, "three records; the blank line is not one");
+        assert_eq!(seen.len(), 3);
+        assert!(seen[0].applied);
+        assert_eq!(seen[1].refused.as_deref(), Some("invalid"));
+        assert!(seen[2].applied, "the line after the torn one");
+        assert_eq!(map.blocked.len(), 2);
+        assert_eq!(block_rows(&s).len(), 2);
+    }
+
+    // Each outcome is emitted as it is decided, not when the input ends.
+    #[test]
+    fn outcomes_are_emitted_as_they_are_decided() {
+        let s = store("ingest-order");
+        let mut map = MemoryMap::default();
+        let input = "{\"src_ip\":\"198.51.100.20\",\"rule\":\"a\",\"evidence\":\"1\"}\n\
+                     {\"src_ip\":\"198.51.100.21\",\"rule\":\"a\",\"evidence\":\"2\"}\n";
+        let mut blocked_when_emitted = Vec::new();
+        Intake {
+            sink: &mut map,
+            store: Some(&s),
+            judge: &mut judge(),
+            ttl: 60,
+            dry_run: false,
+        }
+        .stream(input.as_bytes(), &|| T_INGEST, &mut |o| {
+            blocked_when_emitted.push((o.action.ip.clone(), block_rows(&s).len()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            blocked_when_emitted,
+            [
+                (Some("198.51.100.20".to_string()), 1),
+                (Some("198.51.100.21".to_string()), 2)
+            ],
+            "the first outcome is emitted before the second line is read"
+        );
+    }
+
+    #[test]
+    fn a_finding_round_trips_and_the_provenance_is_prefixed() {
+        let line = r#"{"src_ip":"198.51.100.20","rule":"scanner_detected","evidence":"ua=\"pplsip\"","ts":"2026-09-03T16:40:00Z"}"#;
+        let f: Finding = serde_json::from_str(line).unwrap();
+        assert_eq!(serde_json::to_string(&f).unwrap(), line);
+        let no_ts = r#"{"src_ip":"198.51.100.20","rule":"r","evidence":"e"}"#;
+        let f: Finding = serde_json::from_str(no_ts).unwrap();
+        assert_eq!(
+            serde_json::to_string(&f).unwrap(),
+            no_ts,
+            "an absent ts stays absent"
+        );
+        assert_eq!(provenance("scanner_detected"), "sipnab:scanner_detected");
     }
 }

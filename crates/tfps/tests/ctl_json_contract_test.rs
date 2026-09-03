@@ -22,7 +22,7 @@ use std::net::Ipv4Addr;
 use std::path::Path;
 
 use serde::{de::DeserializeOwned, Serialize};
-use tfps::condemn::{invalid, lift, place, Judge, MemoryMap, Request};
+use tfps::condemn::{invalid, lift, place, Finding, Intake, Judge, MemoryMap, Request};
 use tfps::contract::{Action, Banned, Dropped, Label, Status};
 use tfps::ctl::{attribute, latest_reasons, status_of, to_banned, to_dropped};
 use tfps::drops::DropRow;
@@ -36,6 +36,8 @@ const DROPPED: &str = include_str!("fixtures/tfps-dropped-golden.jsonl");
 const BAN: &str = include_str!("fixtures/tfps-ban-golden.jsonl");
 const UNBAN: &str = include_str!("fixtures/tfps-unban-golden.jsonl");
 const LABELS: &str = include_str!("fixtures/tfps-labels-golden.jsonl");
+const EVIDENCE: &str = include_str!("fixtures/sipnab-evidence-golden.jsonl");
+const EVIDENCE_RESULT: &str = include_str!("fixtures/sipnab-evidence-result-golden.jsonl");
 
 /// 2026-09-03T16:40:00Z, the instant every fixture is written around.
 const T0: u32 = 1_788_453_600;
@@ -419,4 +421,82 @@ fn unban_is_produced_from_the_one_lifting_rule() {
     let lifts = s.unbans(10).unwrap();
     assert_eq!(lifts.len(), 1, "only the lift that happened is recorded");
     assert_eq!(lifts[0].ip, "198.51.100.20");
+}
+
+// ---- R4: the evidence channel ----
+//
+// sipnab holds both files: it asserts its emitter writes the first and its
+// reader accepts the second. This side asserts the opposite pair.
+
+/// Every well-formed evidence line round-trips through `Finding`, and exactly
+/// one line is torn -- the fixture must carry the case the stream property is
+/// about, or a reader that aborts on the first bad line would pass.
+#[test]
+fn the_evidence_fixture_round_trips_and_carries_one_torn_line() {
+    let mut torn = 0;
+    for l in lines(EVIDENCE) {
+        match serde_json::from_str::<Finding>(l) {
+            Ok(f) => assert_eq!(serde_json::to_string(&f).unwrap(), l),
+            Err(_) => torn += 1,
+        }
+    }
+    assert_eq!(
+        torn, 1,
+        "exactly one torn line, in the middle of the stream"
+    );
+    for l in lines(EVIDENCE_RESULT) {
+        round_trip::<Action>(l);
+    }
+    assert_eq!(
+        lines(EVIDENCE).len(),
+        lines(EVIDENCE_RESULT).len(),
+        "one result per input line"
+    );
+}
+
+#[test]
+fn ingest_produces_the_result_fixture_from_the_evidence_fixture() {
+    let s = fresh("ingest");
+    let mut map = MemoryMap::default();
+    let mut got = Vec::new();
+    let n = Intake {
+        sink: &mut map,
+        store: Some(&s),
+        judge: &mut judge(),
+        ttl: 3600,
+        dry_run: false,
+    }
+    .stream(EVIDENCE.as_bytes(), &|| T_BAN, &mut |o| {
+        got.push(emit(&o.action));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(n, 5);
+    assert_eq!(got, lines(EVIDENCE_RESULT));
+    // What the fixture cannot show: exactly the two applied findings reached
+    // the map and the audit log, with their provenance.
+    assert_eq!(
+        map.blocked
+            .keys()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["198.51.100.20", "198.51.100.22"]
+    );
+    let mut rules: Vec<(String, String)> = s
+        .blocks(10, None)
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.reason, r.detail))
+        .collect();
+    rules.sort();
+    assert_eq!(
+        rules,
+        [
+            ("sipnab:options_flood".to_string(), "rate=120/s".to_string()),
+            (
+                "sipnab:scanner_detected".to_string(),
+                "ua=\"pplsip\" detection=ua_pattern".to_string()
+            ),
+        ]
+    );
 }

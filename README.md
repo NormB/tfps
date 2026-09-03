@@ -424,6 +424,7 @@ tfps_ctl ban <ip>... [--ttl N] [--dry-run] [--json]
 tfps_ctl sources [--peer --country]   learned sources and the countries they call
 tfps_ctl source <peer>                everything known about one source
 tfps_ctl peers                        sources by country breadth, when last heard
+tfps_ctl ingest [--ttl N] [--dry-run] apply findings from sipnab: JSON Lines in, one line out each
 tfps_ctl log [--limit N] [--ip IP]    the block audit log, newest first
 tfps_ctl log --json [--limit N]       every label as JSON Lines — all of them unless you say --limit
 ```
@@ -447,6 +448,29 @@ as rule `manual`, detail `operator`, so `banned --why`, `dropped` and the label 
 all know who asked. `--dry-run` reports what would happen and writes nothing. With
 `--json` each address is one line: `{"ip","action","applied","refused","expires","source"}`,
 where `refused` is `self`, `ignoreip`, `not-blocked`, `invalid` or `null`.
+
+### Evidence from sipnab — `tfps_ctl ingest`
+
+sipnab never bans anything. It publishes evidence, and a system whose entire job is
+condemning sources decides what to do with it. `ingest` reads one finding per line on
+stdin — the same `{"src_ip","rule","evidence"}` that sipnab's `--alert-exec` already hands
+a shell command, plus an optional `"ts"` — and applies each one **exactly as `ban` would
+apply the address**: this host and `ignoreip` are refused, the TTL is `--ttl` (default
+3600 s, `0` = never), and the audit row carries rule `sipnab:<rule>` with the evidence as
+its detail, so `log --json` later says who asked and why. One `ban`-shaped line comes out
+per finding, in order, as each is decided, with `"source":"sipnab"`; a line that is not a
+finding is reported as `"refused":"invalid"` on its own line and never stops the lines
+after it. `--dry-run` reports every decision and writes nothing.
+
+```console
+# printf '%s\n' '{"src_ip":"198.51.100.20","rule":"scanner_detected","evidence":"ua=\"pplsip\" detection=ua_pattern","ts":"2026-09-03T16:40:00Z"}' | tfps_ctl ingest
+{"ip":"198.51.100.20","action":"ban","applied":true,"refused":null,"expires":"2026-09-03T17:40:10Z","source":"sipnab"}
+ingested 1 findings: 1 applied, 0 refused, 0 invalid
+```
+
+Both sides of that pipe are pinned: `crates/tfps/tests/fixtures/sipnab-evidence-golden.jsonl`
+is what sipnab writes and `sipnab-evidence-result-golden.jsonl` is what comes back, byte
+for byte in both repositories.
 
 ```console
 # tfps_ctl status --json
