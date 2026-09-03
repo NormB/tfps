@@ -41,7 +41,7 @@ USAGE: tfps_ctl <command> [options]
   peers                        sources by country breadth, when last heard
   countries <peer>             the countries a source has been seen to call
   log [--limit N] [--ip IP]    the block audit log, newest first
-  log --json                   every label as JSON Lines, for an external analyzer
+  log --json [--limit N]       every label as JSON Lines, for an external analyzer
   forget <peer> [--a NUMBER]   erase learned state (requires tfps stopped)
 
 SOURCE FILTERS:
@@ -70,7 +70,9 @@ struct Args {
     a_number: Option<String>,
     country: Option<String>,
     ip: Option<String>,
-    limit: usize,
+    /// `--limit`, only when the operator gave one. What "no limit given" means
+    /// depends on the surface -- see [`Args::rows`] and [`Args::export_rows`].
+    limit: Option<usize>,
     ttl: u64,
     all: bool,
     why: bool,
@@ -87,7 +89,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         a_number: None,
         country: None,
         ip: None,
-        limit: 50,
+        limit: None,
         ttl: 3600,
         all: false,
         why: false,
@@ -108,9 +110,11 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--ip" => a.ip = Some(value("--ip", &mut it)?),
             "--json" => a.json = true,
             "--limit" => {
-                a.limit = value("--limit", &mut it)?
-                    .parse()
-                    .map_err(|e| format!("invalid --limit: {e}"))?
+                a.limit = Some(
+                    value("--limit", &mut it)?
+                        .parse()
+                        .map_err(|e| format!("invalid --limit: {e}"))?,
+                )
             }
             "--ttl" => {
                 a.ttl = value("--ttl", &mut it)?
@@ -129,6 +133,23 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         return Err(String::new());
     }
     Ok(a)
+}
+
+impl Args {
+    /// How many rows a human table shows: the operator's number, else fifty.
+    fn rows(&self) -> usize {
+        self.limit.unwrap_or(50)
+    }
+
+    /// How many records an export emits: the operator's number, else all of them.
+    ///
+    /// Not fifty. The export once borrowed the table's default and a real run
+    /// scored sipnab against a corpus cut off before its `exempt` rows -- a
+    /// wrong answer that looked like a measured one. A machine reader wants
+    /// everything; a human asked for a page.
+    fn export_rows(&self) -> usize {
+        self.limit.unwrap_or(usize::MAX)
+    }
 }
 
 fn main() -> ExitCode {
@@ -455,7 +476,7 @@ fn banned(args: &Args) -> Result<(), String> {
 /// disagree about an address.
 fn dropped(args: &Args) -> Result<(), String> {
     let s = Store::open_readonly(&args.db)?;
-    let rows = s.dropped(args.limit, args.ip.as_deref())?;
+    let rows = s.dropped(args.rows(), args.ip.as_deref())?;
     if rows.is_empty() {
         say!(
             "no dropped traffic recorded — the daemon writes this at checkpoint (every 5 \
@@ -581,7 +602,7 @@ fn sources(args: &Args) -> Result<(), String> {
     let f = SourceFilter {
         peer: args.peer.as_deref(),
         country: args.country.as_deref(),
-        limit: args.limit,
+        limit: args.rows(),
     };
     let rows = s.find_sources(&f)?;
     if rows.is_empty() {
@@ -651,7 +672,7 @@ fn peers(args: &Args) -> Result<(), String> {
     }
     say!("{:<16} {:>9} {:>9}  COUNTRIES", "PEER", "COUNTRIES", "LAST");
     let now = now();
-    for (peer, ncoun, last) in rows.iter().take(args.limit) {
+    for (peer, ncoun, last) in rows.iter().take(args.rows()) {
         let seen: Vec<&str> = s.peer_countries(peer).unwrap_or_default();
         say!(
             "{:<16} {:>9} {:>9}  {}",
@@ -700,25 +721,36 @@ struct JsonLabel<'a> {
     verdict: &'a str,
 }
 
+/// Every label the export emits, one JSON object per line, in order.
+///
+/// Built as lines rather than printed directly so a test can count them:
+/// the export once shared the table's default of fifty and silently cut a
+/// real corpus short, and nothing here could have noticed.
+fn label_lines(s: &Store, args: &Args) -> Result<Vec<String>, String> {
+    s.labels(args.export_rows())?
+        .iter()
+        .map(|l| {
+            let row = JsonLabel {
+                ip: &l.ip,
+                rule: &l.rule,
+                detail: &l.detail,
+                first_seen: l.first_seen,
+                expires: l.expires,
+                unbanned_at: l.unbanned_at,
+                enforced: l.enforced,
+                verdict: l.verdict,
+            };
+            serde_json::to_string(&row).map_err(|e| format!("serialising a label: {e}"))
+        })
+        .collect()
+}
+
 fn log_json(args: &Args) -> Result<(), String> {
     let s = Store::open_readonly(&args.db)?;
-    for l in s.labels(args.limit)? {
-        let row = JsonLabel {
-            ip: &l.ip,
-            rule: &l.rule,
-            detail: &l.detail,
-            first_seen: l.first_seen,
-            expires: l.expires,
-            unbanned_at: l.unbanned_at,
-            enforced: l.enforced,
-            verdict: l.verdict,
-        };
+    for line in label_lines(&s, args)? {
         // JSON Lines: one object per line, so a consumer can stream it and a
         // truncated file still yields every complete record before the cut.
-        say!(
-            "{}",
-            serde_json::to_string(&row).map_err(|e| format!("serialising a label: {e}"))?
-        );
+        say!("{line}");
     }
     Ok(())
 }
@@ -728,7 +760,7 @@ fn log(args: &Args) -> Result<(), String> {
         return log_json(args);
     }
     let s = Store::open_readonly(&args.db)?;
-    let rows: Vec<BlockRow> = s.blocks(args.limit, args.ip.as_deref())?;
+    let rows: Vec<BlockRow> = s.blocks(args.rows(), args.ip.as_deref())?;
     if rows.is_empty() {
         say!("the audit log is empty");
         return Ok(());
@@ -879,7 +911,57 @@ mod tests {
         .unwrap();
         assert_eq!(a.peer.as_deref(), Some("10.0.0.5"));
         assert_eq!(a.country.as_deref(), Some("gb"));
-        assert_eq!(a.limit, 5);
+        assert_eq!(a.limit, Some(5));
+    }
+
+    // ---- The export was truncating: `log --json` shared the table's default ----
+    //
+    // The help says "every label as JSON Lines" and the command emitted fifty.
+    // A real export scored sipnab against a cut-off corpus with the `exempt`
+    // class missing from the end of it. `--json` means every label unless the
+    // operator names a number; the human table keeps its fifty.
+
+    fn store_with_labels(name: &str, n: u32) -> Store {
+        let s = Store::open(&ctl_db(name)).unwrap();
+        for i in 0..n {
+            s.log_decision(
+                1_000 + i,
+                Ipv4Addr::from(u32::from(Ipv4Addr::new(198, 51, 100, 0)) + i),
+                &tfps_core::disposition::Disposition::Block {
+                    kind: "scanner",
+                    detail: "sipvicious",
+                },
+                3600,
+            )
+            .unwrap();
+        }
+        s
+    }
+
+    #[test]
+    fn the_json_export_is_every_label_unless_a_limit_is_asked_for() {
+        let s = store_with_labels("json-unlimited", 60);
+        let a = args(&["log", "--json"]).unwrap();
+        assert_eq!(
+            label_lines(&s, &a).unwrap().len(),
+            60,
+            "--json must export every label; a truncated corpus is a wrong score"
+        );
+        let a = args(&["log", "--json", "--limit", "10"]).unwrap();
+        assert_eq!(
+            label_lines(&s, &a).unwrap().len(),
+            10,
+            "an explicit --limit still applies to the export"
+        );
+    }
+
+    // NEGATIVE CONTROL: the human table keeps its default. Lifting the cap
+    // everywhere would make `tfps_ctl log` on a busy box scroll for minutes.
+    #[test]
+    fn the_human_table_still_stops_at_fifty_by_default() {
+        let s = store_with_labels("table-fifty", 60);
+        let a = args(&["log"]).unwrap();
+        assert_eq!(s.blocks(a.rows(), None).unwrap().len(), 50);
     }
 
     #[test]

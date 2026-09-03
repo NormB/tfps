@@ -422,6 +422,7 @@ tfps_ctl sources [--peer --country]   learned sources and the countries they cal
 tfps_ctl source <peer>                everything known about one source
 tfps_ctl peers                        sources by country breadth, when last heard
 tfps_ctl log [--limit N] [--ip IP]    the block audit log, newest first
+tfps_ctl log --json [--limit N]       every label as JSON Lines — all of them unless you say --limit
 ```
 
 ```console
