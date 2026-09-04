@@ -77,11 +77,13 @@ impl<'a> Request<'a> {
     }
 
     /// The `From` tag, needed to match a forged response.
+    #[must_use]
     pub fn from_tag(&self) -> Option<&'a str> {
         self.from.and_then(|v| param(v, "tag"))
     }
 
     /// The topmost `Via` `branch` — the transaction matcher of RFC 3261 §17.1.3.
+    #[must_use]
     pub fn via_branch(&self) -> Option<&'a str> {
         self.via.and_then(|v| param(v, "branch"))
     }
@@ -91,6 +93,7 @@ impl<'a> Request<'a> {
     /// **This is the whole authentication signal.** A request without one that receives a
     /// `401` is the normal digest handshake; a request *with* one that receives a `401` is
     /// a rejected password.
+    #[must_use]
     pub fn is_authenticated_attempt(&self) -> bool {
         self.authorization.is_some()
     }
@@ -160,6 +163,7 @@ pub struct Response<'a> {
 
 impl<'a> Response<'a> {
     /// The `branch` of the topmost `Via` — the transaction identifier of RFC 3261 §17.1.3.
+    #[must_use]
     pub fn via_branch(&self) -> Option<&'a str> {
         self.via.and_then(|v| param(v, "branch"))
     }
@@ -169,11 +173,13 @@ impl<'a> Response<'a> {
     /// Named in full because `CONTEXT.md` reserves plain "challenge" for a verdict that
     /// diverts a suspicious call to voice verification. Two different things; one word
     /// between them would be a silent bug.
+    #[must_use]
     pub fn is_digest_challenge(&self) -> bool {
         self.status == 401 || self.status == 407
     }
 
     /// Did the request succeed? Any `2xx`.
+    #[must_use]
     pub fn is_success(&self) -> bool {
         (200..300).contains(&self.status)
     }
@@ -188,6 +194,7 @@ impl<'a> Response<'a> {
 /// **`CSeq` is part of the key on purpose**: a client retrying a password keeps one
 /// `Call-ID` and increments `CSeq`, so keying on `Call-ID` alone would collapse an entire
 /// guessing run into a single countable failure.
+#[must_use]
 pub fn transaction_key(
     branch: Option<&str>,
     call_id: Option<&str>,
@@ -281,6 +288,7 @@ fn parse_response(text: &str) -> Option<Response<'_>> {
 /// Returns `None` when the buffer is not UTF-8 or does not start with a plausible request
 /// line. **That is not a system error and never a reason to block** — `SPEC.md` §4:
 /// whatever cannot be interpreted falls out of scope and passes.
+#[must_use]
 pub fn parse_request(buf: &[u8]) -> Option<Request<'_>> {
     // SIP headers are ASCII in practice. A non-UTF-8 payload is junk or is not SIP; the
     // handling is the same either way: not this system's business.

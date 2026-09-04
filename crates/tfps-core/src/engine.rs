@@ -37,8 +37,8 @@ pub enum Mode {
 }
 
 impl Mode {
-    fn is_learning(&self, now: Timestamp) -> bool {
-        matches!(self, Mode::Learning { until } if now < *until)
+    fn is_learning(self, now: Timestamp) -> bool {
+        matches!(self, Mode::Learning { until } if now < until)
     }
 }
 
@@ -181,7 +181,7 @@ pub const REG_SCAN_WINDOW_SECS: u32 = 600;
 fn ext_id(aor: &str) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     for b in aor.bytes() {
-        h ^= b.to_ascii_lowercase() as u64;
+        h ^= u64::from(b.to_ascii_lowercase());
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     h
@@ -307,6 +307,7 @@ pub struct Engine {
 
 impl Engine {
     /// A perimeter-only engine: noise reduction, no behavioural detection. The default.
+    #[must_use]
     pub fn new(default_plan: DialPlan, mode: Mode) -> Self {
         Self {
             peers: HashMap::new(),
@@ -322,11 +323,13 @@ impl Engine {
     }
 
     /// Turns behavioural fraud detection on. Opt-in, per the product's shape.
+    #[must_use]
     pub fn with_behavioural(mut self) -> Self {
         self.behavioural = true;
         self
     }
 
+    #[must_use]
     pub fn behavioural_enabled(&self) -> bool {
         self.behavioural
     }
@@ -337,6 +340,7 @@ impl Engine {
         self.peers.entry(peer).or_default().dial_plan = plan;
     }
 
+    #[must_use]
     pub fn mode(&self) -> Mode {
         self.mode
     }
@@ -346,6 +350,7 @@ impl Engine {
     }
 
     /// The calibrated parameters currently in force, for the report.
+    #[must_use]
     pub fn params(&self) -> &Params {
         &self.params
     }
@@ -369,18 +374,21 @@ impl Engine {
         unknown
     }
 
+    #[must_use]
     pub fn home_country_count(&self) -> usize {
         self.home_countries.len()
     }
 
     /// Is this a registered peer that authenticated within `KNOWN_PEER_TTL_SECS`? Such a
     /// source is never banned — it proved it holds valid credentials.
+    #[must_use]
     pub fn is_known_peer(&self, ip: Ipv4Addr, now: Timestamp) -> bool {
         self.known_peers
             .get(&ip)
             .is_some_and(|last| now.0.saturating_sub(*last) < KNOWN_PEER_TTL_SECS)
     }
 
+    #[must_use]
     pub fn known_peer_count(&self) -> usize {
         self.known_peers.len()
     }
@@ -439,11 +447,13 @@ impl Engine {
         }
     }
 
+    #[must_use]
     pub fn peer_count(&self) -> usize {
         self.peers.len()
     }
 
     /// Distinct sources under watch.
+    #[must_use]
     pub fn source_count(&self) -> usize {
         self.peers.len()
     }
@@ -486,6 +496,7 @@ impl Engine {
     }
 
     /// Approximate memory held by detector state, for the report.
+    #[must_use]
     pub fn approx_state_bytes(&self) -> usize {
         // A SourceAnomaly is a fixed handful of words: two walks, a rate posterior, a
         // 256-bit country set. Call it ~200 bytes per peer with map overhead.

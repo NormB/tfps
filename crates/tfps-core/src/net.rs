@@ -41,6 +41,7 @@ pub enum NotUdp {
 /// This exists so the blind-spot warning can be **specific**: counting all TCP on the wire
 /// would include SSH and HTTP, and an alarm that fires because of the administrator's own
 /// session is noise, not signal.
+#[must_use]
 pub fn tcp_ports(pkt: &[u8]) -> Option<(u16, u16)> {
     if pkt.len() < IPV4_MIN_HEADER || pkt[0] >> 4 != 4 || pkt[9] != 6 {
         return None;
@@ -56,6 +57,7 @@ pub fn tcp_ports(pkt: &[u8]) -> Option<(u16, u16)> {
 }
 
 /// Classifies non-IPv4/UDP traffic so blind spots can be counted.
+#[must_use]
 pub fn classify_other(pkt: &[u8]) -> NotUdp {
     if pkt.is_empty() {
         return NotUdp::Other;
@@ -82,6 +84,7 @@ pub fn classify_other(pkt: &[u8]) -> NotUdp {
 /// fragments. **A non-initial fragment has no L4 header**, one of the limitations recorded
 /// in the eBPF research: the observer sees loose fragments and only the first carries
 /// ports.
+#[must_use]
 pub fn parse_ipv4_udp(pkt: &[u8]) -> Option<UdpDatagram<'_>> {
     if pkt.len() < IPV4_MIN_HEADER {
         return None;

@@ -31,6 +31,7 @@ pub struct Batch {
 ///
 /// `start_id` comes from what was persisted: resuming from the last ID avoids re-downloading
 /// the whole list on every restart.
+#[must_use]
 pub fn spawn(key: String, start_id: Option<String>) -> Receiver<Batch> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {

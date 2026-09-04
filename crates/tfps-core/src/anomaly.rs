@@ -37,6 +37,7 @@ impl SeqTest {
     /// `theta0` < `theta1`, both in (0, 1); `alpha` is the false-alarm rate, `beta` the miss
     /// rate. The bound `ln((1−β)/α)` is Wald's, and it is where "how many is too many"
     /// stops being a guess.
+    #[must_use]
     pub fn new(theta0: f64, theta1: f64, alpha: f64, beta: f64) -> Self {
         let upper = ((1.0 - beta) / alpha).ln();
         Self {
@@ -81,15 +82,18 @@ impl SeqTest {
     }
 
     /// The non-negative evidence this arm contributes to the fused total.
+    #[must_use]
     pub fn evidence(&self) -> f64 {
         self.llr.max(0.0)
     }
 
     /// Would this arm fire on its own?
+    #[must_use]
     pub fn fired(&self) -> bool {
         self.llr >= self.upper
     }
 
+    #[must_use]
     pub fn bound(&self) -> f64 {
         self.upper
     }
@@ -112,6 +116,7 @@ impl RateModel {
     /// `prior_mean` is the population's typical count per scoring period; `prior_strength`
     /// is how many periods of pseudo-evidence it is worth (small = weak prior, adapts fast).
     /// `decay` in (0, 1] forgets old evidence so the baseline tracks legitimate growth.
+    #[must_use]
     pub fn new(prior_mean: f64, prior_strength: f64, decay: f64) -> Self {
         Self {
             a: prior_mean * prior_strength,
@@ -122,13 +127,14 @@ impl RateModel {
 
     /// Surprise of observing `count` this period, in bits, **before** folding it in — so a
     /// fraud spike is scored against the baseline it has not yet polluted.
+    #[must_use]
     pub fn surprise_bits(&self, count: u32) -> f64 {
         // Predictive is NegBin(r=a, p=b/(b+1)); surprise = −log2 P(X ≥ count).
         let r = self.a;
         let p = self.b / (self.b + 1.0);
         let mut cdf_below = 0.0f64;
         for j in 0..count {
-            let jf = j as f64;
+            let jf = f64::from(j);
             let logpmf = ln_gamma(jf + r) - ln_gamma(r) - ln_gamma(jf + 1.0)
                 + r * p.ln()
                 + jf * (1.0 - p).ln();
@@ -140,11 +146,12 @@ impl RateModel {
 
     /// Folds a period's count into the posterior, with forgetting.
     pub fn update(&mut self, count: u32) {
-        self.a = self.a * self.decay + count as f64;
+        self.a = self.a * self.decay + f64::from(count);
         self.b = self.b * self.decay + 1.0;
     }
 
     /// The current mean-rate estimate, for reporting.
+    #[must_use]
     pub fn rate(&self) -> f64 {
         self.a / self.b
     }
@@ -254,6 +261,7 @@ impl Default for SourceAnomaly {
 }
 
 impl SourceAnomaly {
+    #[must_use]
     pub fn new(p: &Params) -> Self {
         Self {
             seen_countries: [0; 4],
@@ -291,7 +299,7 @@ impl SourceAnomaly {
     fn prefix_first_contact(&mut self, prefix: &str) -> bool {
         let mut h: u64 = 1469598103934665603;
         for byte in prefix.bytes() {
-            h ^= byte as u64;
+            h ^= u64::from(byte);
             h = h.wrapping_mul(1099511628211);
         }
         let bit = 1u64 << (h % 64);
@@ -323,9 +331,9 @@ impl SourceAnomaly {
         // Leak the prefix walk by the time since the last call — a 10-minute half-life, so
         // a burst inside the 5-15 min window still counts while slow variety leaks away.
         if self.last_call != 0 {
-            let dt = now.saturating_sub(self.last_call) as f64;
+            let dt = f64::from(now.saturating_sub(self.last_call));
             self.prefix_scan
-                .decay(0.5f64.powf(dt / SCAN_HALFLIFE_SECS as f64));
+                .decay(0.5f64.powf(dt / f64::from(SCAN_HALFLIFE_SECS)));
         }
         self.last_call = now;
 
@@ -351,9 +359,9 @@ impl SourceAnomaly {
     /// rule keeps. Returns the refreshed verdict, which may now fire.
     pub fn observe_completion(&mut self, completed: bool, now: u32) -> Verdict {
         if self.last_call != 0 {
-            let dt = now.saturating_sub(self.last_call) as f64;
+            let dt = f64::from(now.saturating_sub(self.last_call));
             self.completion_scan
-                .decay(0.5f64.powf(dt / SCAN_HALFLIFE_SECS as f64));
+                .decay(0.5f64.powf(dt / f64::from(SCAN_HALFLIFE_SECS)));
         }
         // Completions share the activity clock, so the decay measures time since the last
         // event on this source, not since its last INVITE.
@@ -393,10 +401,12 @@ impl SourceAnomaly {
     }
 
     /// The source's learned international-call rate, for the population prior fit.
+    #[must_use]
     pub fn learned_rate(&self) -> f64 {
         self.rate.rate()
     }
 
+    #[must_use]
     pub fn distinct_countries(&self) -> u32 {
         self.n_countries
     }
@@ -404,6 +414,7 @@ impl SourceAnomaly {
     /// The slow-moving state worth persisting: which countries this source has been seen to
     /// call, and its learned rate posterior. The fast walk evidence is intra-burst and, like
     /// the old debut window, is not persisted — a restart loses at most a burst's worth.
+    #[must_use]
     pub fn snapshot(&self) -> AnomalySnapshot {
         AnomalySnapshot {
             seen_countries: self.seen_countries,
@@ -414,6 +425,7 @@ impl SourceAnomaly {
     }
 
     /// Rebuilds from a snapshot at boot.
+    #[must_use]
     pub fn from_snapshot(p: &Params, snap: AnomalySnapshot) -> Self {
         let mut me = Self::new(p);
         me.seen_countries = snap.seen_countries;

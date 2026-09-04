@@ -50,6 +50,7 @@ pub struct IgnoreList {
 }
 
 impl IgnoreList {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -129,6 +130,7 @@ impl IgnoreList {
 
     /// Declared entries that have never matched. Local ones are excluded: the host not
     /// attacking itself is the normal case, not a stale rule.
+    #[must_use]
     pub fn cold(&self) -> Vec<&str> {
         self.entries
             .iter()
@@ -137,14 +139,17 @@ impl IgnoreList {
             .collect()
     }
 
+    #[must_use]
     pub fn total_hits(&self) -> u64 {
         self.entries.iter().map(|e| e.hits).sum()
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    #[must_use]
     pub fn declared(&self) -> usize {
         self.entries
             .iter()
@@ -152,6 +157,7 @@ impl IgnoreList {
             .count()
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

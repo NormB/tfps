@@ -51,11 +51,13 @@ impl DialPlan {
     }
 
     /// Declares that this PBX sends plain E.164. See the `bare_e164` field.
+    #[must_use]
     pub fn with_bare_e164(mut self) -> Self {
         self.bare_e164 = true;
         self
     }
 
+    #[must_use]
     pub fn prefixes(&self) -> &[String] {
         &self.prefixes
     }
@@ -67,6 +69,7 @@ impl DialPlan {
     /// block. Repeating `R07` from the Java-era TFPS, which denied everything it could not
     /// classify and became 39% of all rejections, is the mistake this function exists to
     /// avoid.
+    #[must_use]
     pub fn to_international(&self, dialed: &str) -> Option<InternationalDigits> {
         self.to_international_with_prefix(dialed).map(|(d, _)| d)
     }
@@ -108,6 +111,7 @@ impl DialPlan {
 
     /// Does the dialled string match any declared prefix? A cheap hot-path gate that
     /// allocates nothing — used to discard domestic traffic before doing any work.
+    #[must_use]
     pub fn looks_international(&self, dialed: &str) -> bool {
         if self.bare_e164 {
             return true;

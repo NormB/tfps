@@ -297,6 +297,7 @@ const _: () = assert!(COUNTRY_COUNT <= 256);
 /// Longest-match is mandatory and not a detail: `1` is the whole NANP, but `1246` is
 /// Barbados. Matching short would place half the Caribbean inside the United States and
 /// destroy per-country novelty exactly where IRSF is common.
+#[must_use]
 pub fn resolve(digits: &InternationalDigits) -> Option<Country> {
     let d = digits.0.as_str();
     let mut best: Option<usize> = None;
@@ -318,6 +319,7 @@ pub fn resolve(digits: &InternationalDigits) -> Option<Country> {
 /// A linear scan: the table has 240 entries and this is never on the packet path.
 /// The stable index for an ISO label (case-insensitive), for configuring home countries.
 /// `+1` countries share the `NANP` label. Returns `None` for a label not in the table.
+#[must_use]
 pub fn index_for_iso(iso: &str) -> Option<CountryIndex> {
     CODES
         .iter()
@@ -325,6 +327,7 @@ pub fn index_for_iso(iso: &str) -> Option<CountryIndex> {
         .map(|(_, _, i)| CountryIndex(*i))
 }
 
+#[must_use]
 pub fn iso_for_index(index: u16) -> Option<&'static str> {
     CODES
         .iter()
@@ -350,6 +353,7 @@ pub fn decode_bitmap(cur: [u64; 4], prev: [u64; 4]) -> Vec<&'static str> {
 /// This **does not block on its own** (`SPEC.md` §6): measurement put structure at 0.4% of
 /// feature importance, and 72.8% of observed IPRNs are ordinary fixed and mobile numbers.
 /// It contributes to a signal, never a verdict.
+#[must_use]
 pub fn is_non_geographic(c: &Country) -> bool {
     c.iso.starts_with("SAT-") || c.iso.starts_with("NET-") || c.iso.starts_with("INTL-")
 }

@@ -115,6 +115,7 @@ pub enum Loaded {
     Broken(String),
 }
 
+#[must_use]
 pub fn load(path: &Path) -> Loaded {
     if !path.exists() {
         return Loaded::Absent;

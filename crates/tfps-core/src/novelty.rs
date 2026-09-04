@@ -11,6 +11,7 @@
 pub struct Timestamp(pub u32);
 
 impl Timestamp {
+    #[must_use]
     pub fn saturating_sub(self, other: Self) -> u32 {
         self.0.saturating_sub(other.0)
     }

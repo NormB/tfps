@@ -136,6 +136,7 @@ impl Default for NoiseFilter {
 }
 
 impl NoiseFilter {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             hits: vec![0; SIGNATURES.len()],
@@ -212,10 +213,12 @@ impl NoiseFilter {
     }
 
     /// How many signatures the filter knows in total — built-ins plus file entries.
+    #[must_use]
     pub fn signature_count(&self) -> (usize, usize) {
         (SIGNATURES.len(), self.extra.len())
     }
 
+    #[must_use]
     pub fn injection_count(&self) -> (usize, usize) {
         (INJECTION.len(), self.extra_injection.len())
     }
@@ -266,6 +269,7 @@ impl NoiseFilter {
         None
     }
 
+    #[must_use]
     pub fn injections(&self) -> u64 {
         self.injections
     }
@@ -302,15 +306,18 @@ impl NoiseFilter {
         }
     }
 
+    #[must_use]
     pub fn scanner_count(&self) -> (usize, usize) {
         (SCANNER_IDS.len(), self.extra_scanners.len())
     }
 
+    #[must_use]
     pub fn scanner_hits(&self) -> u64 {
         self.scanner_hits
     }
 
     /// Signatures that never matched — the candidates for being rotten.
+    #[must_use]
     pub fn cold_signatures(&self) -> Vec<&'static str> {
         self.hits()
             .filter(|(_, n)| *n == 0)
@@ -395,6 +402,7 @@ impl<const N: usize> SlidingCount<N> {
     }
 
     /// How many events fall inside `span`, without recording one.
+    #[must_use]
     pub fn count_within(&self, now: u32, span: u32) -> u32 {
         self.stamps[..self.len as usize]
             .iter()
@@ -459,6 +467,7 @@ impl<const N: usize> RegProbes<N> {
     }
 
     /// How many distinct extensions fall inside `span`, without recording one.
+    #[must_use]
     pub fn count_within(&self, now: u32, span: u32) -> u32 {
         self.stamps[..self.len as usize]
             .iter()
@@ -522,11 +531,10 @@ fn uri_addr(value: &str) -> Option<&str> {
     // userinfo — a real attack shape, `sip:a;drop@host` — and must be kept; a `;` *after*
     // the host is a legitimate URI parameter (`;transport=tcp`) and is dropped. `>` and
     // whitespace always end it; `?` never does (`sip:?=?@host` is an attack).
-    let host_from = rest.find('@').map(|i| i + 1).unwrap_or(0);
+    let host_from = rest.find('@').map_or(0, |i| i + 1);
     let tail = rest[host_from..]
         .find(['>', ';', ' ', '\t'])
-        .map(|i| host_from + i)
-        .unwrap_or(rest.len());
+        .map_or(rest.len(), |i| host_from + i);
     Some(&rest[..tail])
 }
 
