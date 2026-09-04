@@ -141,7 +141,7 @@ fn the_maps_userspace_opens_exist_under_those_names() {
             panic!("no map called `{name}` in tfps_xdp.c; userspace opens it by that name")
         };
         // The map type is in the struct body that ends at the declaration.
-        let body = before.rsplit_once("struct {").map(|(_, b)| b).unwrap_or("");
+        let body = before.rsplit_once("struct {").map_or("", |(_, b)| b);
         assert!(
             body.contains(kind),
             "`{name}` is not a {kind}; userspace would fail to open it as one"

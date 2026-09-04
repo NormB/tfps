@@ -73,7 +73,7 @@ fn the_verdicts_are_exactly_the_three_agreed() {
         .collect();
     let expected: std::collections::BTreeSet<String> = ["blocked", "exempt", "would-block"]
         .iter()
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .collect();
     assert_eq!(
         seen, expected,

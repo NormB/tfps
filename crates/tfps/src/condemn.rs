@@ -61,6 +61,7 @@ pub enum Refusal {
 
 impl Refusal {
     /// The contract's word for it.
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             Refusal::SelfAddress => "self",
@@ -71,6 +72,7 @@ impl Refusal {
     }
 
     /// The sentence for a person.
+    #[must_use]
     pub fn explain(&self) -> String {
         match self {
             Refusal::SelfAddress => "this host's own address".to_string(),
@@ -89,6 +91,7 @@ pub struct Judge {
 
 impl Judge {
     /// From an explicit list of the host's addresses and an ignore list.
+    #[must_use]
     pub fn new(local: Vec<Ipv4Addr>, ignore: IgnoreList) -> Self {
         Self { local, ignore }
     }
@@ -102,6 +105,7 @@ impl Judge {
     /// `--ignoreip` given on its command line can be seen from here. An entry
     /// that fails to parse is announced, never dropped quietly, for the same
     /// reason the daemon announces it.
+    #[must_use]
     pub fn load(local: Vec<Ipv4Addr>, store: Option<&Store>, config: &Path) -> Self {
         let mut ignore = IgnoreList::new();
         let mut seen = std::collections::HashSet::new();
@@ -174,6 +178,7 @@ pub struct Outcome {
 
 impl Outcome {
     /// The sentence for a person.
+    #[must_use]
     pub fn describe(&self) -> String {
         let ip = self.action.ip.as_deref().unwrap_or("?");
         if let Some(r) = &self.refusal {
@@ -294,6 +299,7 @@ pub fn lift(
 }
 
 /// The outcome for an input that named no address.
+#[must_use]
 pub fn invalid(action: &str, source: &str) -> Outcome {
     Outcome {
         action: Action {
@@ -334,6 +340,7 @@ pub struct Finding {
 }
 
 /// The audit `rule` for a finding: the provenance, then sipnab's own name.
+#[must_use]
 pub fn provenance(rule: &str) -> String {
     format!("sipnab:{rule}")
 }

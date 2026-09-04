@@ -81,6 +81,7 @@ pub mod window_offset {
 
 /// The running drop count inside one `drop_windows` value, or `None` when the value is
 /// not the size the program pins — a layout disagreement, never read as zero.
+#[must_use]
 pub fn parse_window_drops(raw: &[u8]) -> Option<u64> {
     if raw.len() < WINDOW_LEN {
         return None;
@@ -113,11 +114,13 @@ pub struct DropEvent {
 
 impl DropEvent {
     /// The SIP request line, or whatever the first line of the payload was.
+    #[must_use]
     pub fn request_line(&self) -> String {
         request_line(&self.preview)
     }
 
     /// `udp` or `tcp` — the only two protocols the program drops.
+    #[must_use]
     pub fn proto_name(&self) -> &'static str {
         proto_name(self.proto)
     }
@@ -127,6 +130,7 @@ impl DropEvent {
 ///
 /// One function for the daemon's line and the control tool's column, so the two never
 /// name the same packet differently.
+#[must_use]
 pub fn proto_name(proto: u8) -> &'static str {
     match proto {
         PROTO_UDP => "udp",
@@ -198,6 +202,7 @@ pub fn parse_event(raw: &[u8]) -> Result<DropEvent, ParseError> {
 ///
 /// Control bytes are masked the way the `NOT-SIP` preview masks them, and a line the
 /// preview cut short is marked, so an operator does not read the cut as the end.
+#[must_use]
 pub fn request_line(preview: &[u8]) -> String {
     let end = preview.iter().position(|b| *b == b'\r' || *b == b'\n');
     let line = &preview[..end.unwrap_or(preview.len())];
@@ -330,6 +335,7 @@ pub struct DropRow {
 
 impl DropDelta {
     /// Converts to wall-clock time, given a pair of readings taken together.
+    #[must_use]
     pub fn to_row(&self, now_wall: u32, now_mono_ns: u64) -> DropRow {
         DropRow {
             ip: self.src.to_string(),
@@ -349,6 +355,7 @@ impl DropDelta {
 ///
 /// An event stamped after the monotonic reading — the drain raced the clock — is
 /// clamped to now rather than allowed to wrap.
+#[must_use]
 pub fn wall_secs(now_wall: u32, now_mono_ns: u64, ev_mono_ns: u64) -> u32 {
     let behind = now_mono_ns.saturating_sub(ev_mono_ns) / 1_000_000_000;
     now_wall.saturating_sub(u32::try_from(behind).unwrap_or(u32::MAX))
@@ -372,11 +379,13 @@ impl Default for Ledger {
 
 impl Ledger {
     /// A ledger bounded at [`MAX_SOURCES`].
+    #[must_use]
     pub fn new() -> Self {
         Self::with_capacity(MAX_SOURCES)
     }
 
     /// A ledger bounded at `cap` sources (at least one).
+    #[must_use]
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             cap: cap.max(1),
@@ -458,11 +467,13 @@ impl Ledger {
     }
 
     /// The summary of a source at least one drop is known from — an event or the map.
+    #[must_use]
     pub fn summary(&self, src: Ipv4Addr) -> Option<&DropSummary> {
         self.sources.get(&src).filter(|s| s.drops > 0)
     }
 
     /// Every source at least one drop is known from, most dropped first.
+    #[must_use]
     pub fn summaries(&self) -> Vec<&DropSummary> {
         let mut out: Vec<&DropSummary> = self.sources.values().filter(|s| s.drops > 0).collect();
         out.sort_by(|a, b| b.drops.cmp(&a.drops).then(a.src.cmp(&b.src)));
@@ -470,11 +481,13 @@ impl Ledger {
     }
 
     /// How many sources at least one drop is known from.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.sources.values().filter(|s| s.drops > 0).count()
     }
 
     /// Whether no drop has been seen from any source.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -514,12 +527,12 @@ impl Ledger {
 ///
 /// A source this process did not block — one placed by hand with `tfps_ctl ban` — is
 /// printed as `unrecorded` rather than given a reason it never had.
+#[must_use]
 pub fn drop_line(ev: &DropEvent, s: &DropSummary) -> String {
     let (kind, detail) = s
         .reason
         .as_ref()
-        .map(|(k, d)| (k.as_str(), d.as_str()))
-        .unwrap_or(("unrecorded", "-"));
+        .map_or(("unrecorded", "-"), |(k, d)| (k.as_str(), d.as_str()));
     format!(
         "DROPPED peer={} reason={kind} detail={detail} proto={} port={} drops={} len={} request=\"{}\"",
         ev.src,

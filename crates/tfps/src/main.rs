@@ -313,7 +313,7 @@ fn apply_config(a: &mut Args, c: &config::Config) {
             // A peer with an invalid IP is a typo that would make the operator believe
             // they declared a plan that does not apply. Never silently.
             Err(e) => {
-                eprintln!("WARNING: peer \"{ip}\" in the config is not a valid IPv4 address ({e})")
+                eprintln!("WARNING: peer \"{ip}\" in the config is not a valid IPv4 address ({e})");
             }
         }
     }
@@ -323,8 +323,7 @@ fn now() -> Timestamp {
     Timestamp(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as u32)
-            .unwrap_or(0),
+            .map_or(0, |d| d.as_secs() as u32),
     )
 }
 
@@ -376,10 +375,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let learn_from = db
-        .as_ref()
-        .map(|d| d.learning_started(start.0))
-        .unwrap_or(start.0);
+    let learn_from = db.as_ref().map_or(start.0, |d| d.learning_started(start.0));
 
     let mode = if args.learn_secs == 0 {
         Mode::Active
@@ -504,9 +500,7 @@ fn main() -> ExitCode {
              calls to your internal destinations and should never be judged or blocked."
         );
     }
-    if !engine.behavioural_enabled() {
-        say!("  mode              : PREVENTION (perimeter/fail2ban replacement; --behavioural adds the experimental layer)");
-    } else {
+    if engine.behavioural_enabled() {
         match mode {
             // The mode is announced loudly and repeated: this project's difference from
             // fail2ban is that the incumbent fails silently (`SPEC.md` §12).
@@ -517,6 +511,8 @@ fn main() -> ExitCode {
                 until.0
             ),
         }
+    } else {
+        say!("  mode              : PREVENTION (perimeter/fail2ban replacement; --behavioural adds the experimental layer)");
     }
     // Enforcement: load XDP, or say so loudly and carry on observing. Never pretend.
     let mut enforcer = if args.no_enforce {
@@ -689,9 +685,10 @@ fn main() -> ExitCode {
         // every restart — the module documents the resume, so not wiring it up would have
         // been a promise kept only in a comment.
         let resume = db.as_ref().and_then(|s| s.meta_get(APIBAN_ID_KEY));
-        match &resume {
-            Some(id) => say!("  APIBAN            : enabled, resuming from id {id}"),
-            None => say!("  APIBAN            : enabled, first sync (whole feed)"),
+        if let Some(id) = &resume {
+            say!("  APIBAN            : enabled, resuming from id {id}")
+        } else {
+            say!("  APIBAN            : enabled, first sync (whole feed)")
         }
         apiban::spawn(k.clone(), resume)
     });
@@ -884,7 +881,7 @@ fn main() -> ExitCode {
                                     say!(
                                         "BLOCKED peer={subject} reason={kind} detail={detail} ttl={}s",
                                         args.block_ttl
-                                    )
+                                    );
                                 }
                                 Err(err) => {
                                     // Nothing was blocked, so nothing is recorded: an audit
@@ -1210,34 +1207,34 @@ fn report(dec: &Decision, peer: Ipv4Addr, verbose: bool) {
             "WOULD BLOCK (learning) peer={peer} country={country} evidence={bits}bits distinct_countries={countries}"
         ),
         Decision::Noise { signature } if verbose => {
-            say!("noise peer={peer} signature={signature}")
+            say!("noise peer={peer} signature={signature}");
         }
         Decision::Scanner { id } => {
             // Always visible: a self-identifying scanner is a clean, high-confidence catch.
-            say!("SCANNER peer={peer} id={id}")
+            say!("SCANNER peer={peer} id={id}");
         }
         Decision::Injection { pattern } if verbose => {
-            say!("injection peer={peer} pattern={pattern}")
+            say!("injection peer={peer} pattern={pattern}");
         }
         Decision::AuthFailure { failures } => {
             // Always visible: a run of rejected credentials is the precursor of Chain A.
-            say!("AUTH FAILURES peer={peer} rejected_credentials_in_window={failures}")
+            say!("AUTH FAILURES peer={peer} rejected_credentials_in_window={failures}");
         }
         Decision::RegScan { extensions } => {
             // Always visible: registration scanning / extension enumeration.
-            say!("REG SCAN peer={peer} distinct_extensions_no_success={extensions}")
+            say!("REG SCAN peer={peer} distinct_extensions_no_success={extensions}");
         }
         Decision::AuthAbuse { attempts } => {
             // The backstop fired, which also says the softswitch never answered.
-            say!("AUTH VOLUME peer={peer} authenticated_attempts_unanswered={attempts}")
+            say!("AUTH VOLUME peer={peer} authenticated_attempts_unanswered={attempts}");
         }
         Decision::UnknownCountry(digits) => {
             // Always visible, even without -v: it is a symptom of a wrong dial plan, and a
             // wrong dial plan means international calls escaping the system entirely.
-            say!("UNKNOWN COUNTRY peer={peer} digits={digits}")
+            say!("UNKNOWN COUNTRY peer={peer} digits={digits}");
         }
         Decision::Pass { country, novel } if verbose => {
-            say!("pass peer={peer} country={country} first_time={novel}")
+            say!("pass peer={peer} country={country} first_time={novel}");
         }
         _ => {}
     }
@@ -1288,9 +1285,7 @@ fn counter_line(s: &tfps_core::engine::Stats, hep: Option<hep::Counters>) -> Str
 
 fn print_stats(e: &Engine, ports: &BTreeMap<u16, u64>, t: Timestamp, mode: Mode) {
     let s = &e.stats;
-    let mode_label = if !e.behavioural_enabled() {
-        "PREVENTION".to_string()
-    } else {
+    let mode_label = if e.behavioural_enabled() {
         match mode {
             Mode::Active => "ACTIVE".to_string(),
             Mode::Learning { until } => {
@@ -1302,6 +1297,8 @@ fn print_stats(e: &Engine, ports: &BTreeMap<u16, u64>, t: Timestamp, mode: Mode)
                 )
             }
         }
+    } else {
+        "PREVENTION".to_string()
     };
     say!(
         "--- mode={mode_label} packets={} sip={} responses={} keepalive={} not_sip={} noise={} ({}%) injection={} scanners={} reg_scan={} auth_att={} auth_fail={} auth_ok={} auth_chal={} auth_volume={} intl_ok={} intl_fail={} invites={} intl={} \
@@ -1342,7 +1339,11 @@ mod tests {
     use super::*;
 
     fn args(v: &[&str]) -> Result<Args, String> {
-        parse_args_from(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        parse_args_from(
+            &v.iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>(),
+        )
     }
 
     // THE PROPERTY: absent, the flag changes nothing. `main` builds a forwarder only from

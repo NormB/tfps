@@ -132,12 +132,12 @@ fn parse(argv: &[String]) -> Result<Args, String> {
                     value("--limit", &mut it)?
                         .parse()
                         .map_err(|e| format!("invalid --limit: {e}"))?,
-                )
+                );
             }
             "--ttl" => {
                 a.ttl = value("--ttl", &mut it)?
                     .parse()
-                    .map_err(|e| format!("invalid --ttl: {e}"))?
+                    .map_err(|e| format!("invalid --ttl: {e}"))?;
             }
             "--all" => a.all = true,
             "--why" => a.why = true,
@@ -340,28 +340,26 @@ fn stats(args: &Args) -> Result<(), String> {
     }
 
     let now = now();
-    match (s.meta_get("stats"), s.meta_get("stats_ts")) {
-        (Some(line), ts) => {
-            let age = ts
-                .and_then(|t| t.parse::<u32>().ok())
-                .map(|t| ago(now.saturating_sub(t)))
-                .unwrap_or_else(|| "unknown".into());
-            say!("\nTRAFFIC  (as of the last checkpoint, {age} ago)");
-            // Two columns, so twenty counters stay readable in a terminal.
-            let pairs: Vec<(&str, &str)> = line
-                .split_whitespace()
-                .filter_map(|kv| kv.split_once('='))
-                .collect();
-            for row in pairs.chunks(2) {
-                let cell = |(k, v): &(&str, &str)| format!("{k:<16} {v:>10}");
-                say!(
-                    "  {}   {}",
-                    cell(&row[0]),
-                    row.get(1).map(cell).unwrap_or_default()
-                );
-            }
+    if let (Some(line), ts) = (s.meta_get("stats"), s.meta_get("stats_ts")) {
+        let age = ts
+            .and_then(|t| t.parse::<u32>().ok())
+            .map_or_else(|| "unknown".into(), |t| ago(now.saturating_sub(t)));
+        say!("\nTRAFFIC  (as of the last checkpoint, {age} ago)");
+        // Two columns, so twenty counters stay readable in a terminal.
+        let pairs: Vec<(&str, &str)> = line
+            .split_whitespace()
+            .filter_map(|kv| kv.split_once('='))
+            .collect();
+        for row in pairs.chunks(2) {
+            let cell = |(k, v): &(&str, &str)| format!("{k:<16} {v:>10}");
+            say!(
+                "  {}   {}",
+                cell(&row[0]),
+                row.get(1).map(cell).unwrap_or_default()
+            );
         }
-        _ => say!("\nTRAFFIC\n  no checkpoint yet — the daemon writes these every 5 minutes"),
+    } else {
+        say!("\nTRAFFIC\n  no checkpoint yet — the daemon writes these every 5 minutes")
     }
     if let Some(t) = s.meta_get("started_at").and_then(|v| v.parse::<u32>().ok()) {
         say!("  {:<16} {:>10}", "running for", ago(now.saturating_sub(t)));
@@ -886,8 +884,7 @@ fn forget(args: &Args) -> Result<(), String> {
 fn now() -> u32 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as u32)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs() as u32)
 }
 
 /// A compact duration. Operators read these in a column, so the widest case has to stay
@@ -914,7 +911,11 @@ mod tests {
     }
 
     fn args(v: &[&str]) -> Result<Args, String> {
-        parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        parse(
+            &v.iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>(),
+        )
     }
 
     #[test]

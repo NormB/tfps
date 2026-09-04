@@ -319,8 +319,7 @@ impl Enforcer {
             Backend::Own { bpf } => bpf
                 .map("blocked")
                 .and_then(|m| BpfHashMap::<_, u32, u64>::try_from(m).ok())
-                .map(|m| m.keys().count())
-                .unwrap_or(0),
+                .map_or(0, |m| m.keys().count()),
         }
     }
 
@@ -401,7 +400,7 @@ pub struct DropSensor {
 /// A poisoned lock means the other side panicked mid-update; the ledger is still the
 /// best record there is, and refusing to read it would silence the sensor.
 fn lock_ledger(m: &Mutex<Ledger>) -> MutexGuard<'_, Ledger> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl DropSensor {
@@ -434,15 +433,14 @@ impl DropSensor {
                 let (ledger, malformed, unannounced) = worker;
                 loop {
                     while let Some(item) = ring.next() {
-                        let ev = match parse_event(&item) {
-                            Ok(ev) => ev,
-                            Err(_) => {
-                                // The two sides disagree on the layout. Counted and
-                                // reported by the main loop; a parse that cannot be
-                                // trusted must not become a line that is.
-                                malformed.fetch_add(1, Ordering::Relaxed);
-                                continue;
-                            }
+                        let ev = if let Ok(ev) = parse_event(&item) {
+                            ev
+                        } else {
+                            // The two sides disagree on the layout. Counted and
+                            // reported by the main loop; a parse that cannot be
+                            // trusted must not become a line that is.
+                            malformed.fetch_add(1, Ordering::Relaxed);
+                            continue;
                         };
                         let (kind, line) = {
                             let mut l = lock_ledger(&ledger);
@@ -486,7 +484,7 @@ impl DropSensor {
     fn sync(&self) {
         let now = monotonic_ns();
         let mut ledger = lock_ledger(&self.ledger);
-        for entry in self.windows.iter() {
+        for entry in &self.windows {
             match entry {
                 Ok((key, value)) => match parse_window_drops(&value) {
                     // The key is the raw `ip->saddr`, the same encoding as `blocked`.
@@ -542,13 +540,13 @@ impl DropSensor {
 ///
 /// Read from `/proc/uptime` to avoid needing `unsafe` or `libc` directly — 10 ms precision
 /// is irrelevant for TTLs measured in minutes.
+#[must_use]
 pub fn monotonic_ns() -> u64 {
     std::fs::read_to_string("/proc/uptime")
         .ok()
         .and_then(|s| s.split_whitespace().next().map(str::to_string))
         .and_then(|s| s.parse::<f64>().ok())
-        .map(|secs| (secs * 1_000_000_000.0) as u64)
-        .unwrap_or(0)
+        .map_or(0, |secs| (secs * 1_000_000_000.0) as u64)
 }
 
 /// The live block map, opened from **outside** the running daemon — what `tfps_ctl`
@@ -711,6 +709,7 @@ pub fn live_counters() -> Result<Counters, String> {
 /// and `unsafe`; the workspace forbids the second and this needs neither.
 ///
 /// It exists so the system cannot condemn the machine it is defending.
+#[must_use]
 pub fn local_addresses() -> Vec<Ipv4Addr> {
     let Ok(text) = std::fs::read_to_string("/proc/net/fib_trie") else {
         return Vec::new();
@@ -736,6 +735,7 @@ pub fn local_addresses() -> Vec<Ipv4Addr> {
 ///
 /// Consistent with the rest of the product: it discovers on its own, announces what it
 /// found, and can be overridden when discovery gets it wrong.
+#[must_use]
 pub fn default_interface() -> Option<String> {
     let routes = std::fs::read_to_string("/proc/net/route").ok()?;
     for line in routes.lines().skip(1) {

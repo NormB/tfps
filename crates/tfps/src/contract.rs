@@ -128,6 +128,7 @@ pub struct Label {
 /// the proleptic-Gregorian algorithm (days from the epoch to year, month, day)
 /// and is pinned to dates a human can check by hand, including the two leap
 /// rules a naive version gets wrong.
+#[must_use]
 pub fn rfc3339(secs: i64) -> String {
     let days = secs.div_euclid(86_400);
     let sod = secs.rem_euclid(86_400);

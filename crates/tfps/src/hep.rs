@@ -164,6 +164,7 @@ pub struct Observed<'a> {
 /// `None` when the payload is too large for the sixteen-bit total length: refusing is the
 /// only honest answer, because a wrapped length would produce a packet a collector reads as
 /// a different, shorter message rather than as an error.
+#[must_use]
 pub fn encode(o: &Observed<'_>, agent_id: u32) -> Option<Vec<u8>> {
     encode_with(o, agent_id, None)
 }
@@ -177,6 +178,7 @@ pub fn encode(o: &Observed<'_>, agent_id: u32) -> Option<Vec<u8>> {
 /// between the passes, so no length field is disturbed. `token_ts` and `nonce`
 /// are arguments so the bytes can be pinned by a test; the forwarder supplies
 /// the clock and a nonce that never repeats.
+#[must_use]
 pub fn encode_with_auth(
     o: &Observed<'_>,
     agent_id: u32,
@@ -266,10 +268,24 @@ fn encode_with(o: &Observed<'_>, agent_id: u32, auth_chunk: Option<&[u8]>) -> Op
 }
 
 /// One generic chunk: vendor, type, a length that covers this six-octet header too, value.
+///
+/// The length field is sixteen bits, and a value that overflows it would write
+/// a length describing a different packet than the one that follows. The
+/// caller that matters -- `encode_with` -- refuses a datagram over `u16::MAX`
+/// before it gets here, so the cast below cannot truncate in this program.
+/// That is a fact about a caller, not about this function, so it is asserted
+/// here rather than assumed: a future caller with a larger value fails the
+/// debug build instead of emitting a malformed chunk to the collector.
 fn chunk(p: &mut Vec<u8>, ty: u16, value: &[u8]) {
+    let len = 6 + value.len();
+    debug_assert!(
+        len <= usize::from(u16::MAX),
+        "chunk value of {} octets overflows the 16-bit length field",
+        value.len()
+    );
     p.extend_from_slice(&VENDOR_GENERIC.to_be_bytes());
     p.extend_from_slice(&ty.to_be_bytes());
-    p.extend_from_slice(&((6 + value.len()) as u16).to_be_bytes());
+    p.extend_from_slice(&u16::try_from(len).unwrap_or(u16::MAX).to_be_bytes());
     p.extend_from_slice(value);
 }
 
@@ -287,6 +303,7 @@ pub struct Counters {
 impl Counters {
     /// The counters as `key=value` pairs, in the shape the checkpoint line and
     /// `tfps_ctl stats` already read. One format, produced in one place.
+    #[must_use]
     pub fn line(&self) -> String {
         format!(
             "hep_sent={} hep_dropped={} hep_failed={}",
@@ -379,8 +396,7 @@ impl Forwarder {
             })?;
         let started = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_nanos() as u64);
         Ok(Self {
             tx,
             agent_id,
@@ -413,8 +429,7 @@ impl Forwarder {
             Some(auth) => {
                 let ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
+                    .map_or(0, |d| d.as_secs());
                 encode_with_auth(o, self.agent_id, auth, ts, &self.next_nonce())
             }
         };

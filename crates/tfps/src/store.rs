@@ -61,6 +61,7 @@ pub struct SourceRow {
 
 impl SourceRow {
     /// The countries this source has been seen to call, as labels.
+    #[must_use]
     pub fn countries(&self) -> Vec<&'static str> {
         match blob_to_words(&self.seen) {
             Some(bits) => country::decode_bitmap(bits, [0; 4]),
@@ -948,8 +949,7 @@ impl Store {
     fn now_stamp(&self) -> u32 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as u32)
-            .unwrap_or(0)
+            .map_or(0, |d| d.as_secs() as u32)
     }
 
     /// Loads the state at boot. An error here is **not fatal** — the system restarts

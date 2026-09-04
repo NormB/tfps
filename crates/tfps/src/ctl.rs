@@ -45,6 +45,7 @@ pub type Audit = HashMap<String, (String, String, u32)>;
 /// other. The audit log wins over the feed: a scanner is often on both --
 /// APIBAN's honeypots catch the same tools -- and the reason WE condemned it
 /// is the perimeter one.
+#[must_use]
 pub fn attribute(audit: &Audit, apiban: &HashSet<String>, ip: &str) -> Attribution {
     if let Some((rule, detail, ts)) = audit.get(ip) {
         Attribution::Perimeter {
@@ -61,6 +62,7 @@ pub fn attribute(audit: &Audit, apiban: &HashSet<String>, ip: &str) -> Attributi
 
 impl Attribution {
     /// The human form, for the tables.
+    #[must_use]
     pub fn why(&self) -> String {
         match self {
             Attribution::Perimeter { rule, detail, .. } => format!("{rule} ({detail})"),
@@ -84,6 +86,7 @@ impl Attribution {
 }
 
 /// The latest audit row for each address, newest wins.
+#[must_use]
 pub fn latest_reasons(store: Option<&Store>) -> Audit {
     let mut audit = Audit::new();
     if let Some(s) = store {
@@ -103,6 +106,7 @@ pub fn latest_reasons(store: Option<&Store>) -> Audit {
 /// when none could. `mode` and `iface` are the daemon's meta values as read;
 /// they are reported only while enforcement is live, because a pair left by a
 /// previous run describes that run, not this one.
+#[must_use]
 pub fn status_of(
     blocked: Option<usize>,
     mode: Option<&str>,
@@ -129,6 +133,7 @@ pub fn status_of(
 /// The map stores the lapse instant in monotonic nanoseconds, `0` for never.
 /// The contract speaks wall clock, so the remaining time is measured against
 /// `now_mono` and added to `now_wall`.
+#[must_use]
 pub fn to_banned(
     ip: Ipv4Addr,
     until_mono: u64,
@@ -156,6 +161,7 @@ pub fn to_banned(
 }
 
 /// One `dropped --json` line from a drop-log row and its attribution.
+#[must_use]
 pub fn to_dropped(r: &DropRow, why: &Attribution) -> Dropped {
     Dropped {
         ip: r.ip.clone(),

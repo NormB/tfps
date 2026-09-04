@@ -41,6 +41,7 @@ pub enum Disposition<'a> {
 
 impl Disposition<'_> {
     /// The rule that fired, for any disposition that has one.
+    #[must_use]
     pub fn kind(&self) -> Option<&str> {
         match self {
             Disposition::Ignore => None,
@@ -55,6 +56,7 @@ impl Disposition<'_> {
     ///
     /// Every judged outcome does. `Ignore` is the only silence, and it is
     /// silence about a source nothing was ever alleged against.
+    #[must_use]
     pub fn is_recordable(&self) -> bool {
         !matches!(self, Disposition::Ignore)
     }
@@ -83,6 +85,7 @@ impl fmt::Display for Disposition<'_> {
 /// curated ignore list outranks a learned registration, and both outrank the
 /// verdict. Enforcement is consulted last, because whether we *act* must never
 /// change whether we *judged*.
+#[must_use]
 pub fn disposition<'a>(
     reason: Option<(&'a str, &'a str)>,
     ignore_rule: Option<&'a str>,
