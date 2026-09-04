@@ -72,6 +72,7 @@ struct Args {
     /// `host:port` of a HEP collector that gets a copy of every SIP message. `None` means
     /// no socket, no thread and nothing on the packet path.
     hep_send: Option<String>,
+    hep_transport: hep::Transport,
     /// The capture agent ID in each HEP packet; `None` takes the module's default.
     hep_agent_id: Option<u32>,
     /// The file holding the shared secret the collector expects; `None` sends plain HEP.
@@ -110,6 +111,7 @@ impl Default for Args {
             peer_plans: Vec::new(),
             given: std::collections::HashSet::new(),
             hep_send: None,
+            hep_transport: hep::Transport::default(),
             hep_agent_id: None,
             hep_auth_file: None,
             hep_auth_mode: hep::AuthMode::Hmac,
@@ -143,7 +145,8 @@ USAGE: tfps [options]
       --home-country ISO   your own country, not treated as international (repeatable)
       --signatures PATH    file that ADDS signatures to the built-in ones
       --config PATH        configuration               (default: /etc/tfps/config.json)
-      --hep-send HOST:PORT send a HEP v3 copy of every SIP message to this UDP collector
+      --hep-send HOST:PORT send a HEP v3 copy of every SIP message to this collector
+      --hep-transport T    udp (default) or tcp -- how the copies reach it
       --hep-agent-id N     capture agent id in each HEP packet (default: 2033)
       --hep-auth-file PATH the shared secret the collector expects (refused if world-readable)
       --hep-auth-mode M    plain (the key verbatim, Homer-style) or hmac (a signed per-message
@@ -233,6 +236,12 @@ fn parse_args_from(argv: &[String]) -> Result<Args, String> {
                 );
             }
             "--hep-auth-file" => a.hep_auth_file = Some(PathBuf::from(next("--hep-auth-file")?)),
+            "--hep-transport" => {
+                a.hep_transport = next("--hep-transport")?
+                    .parse()
+                    .map_err(|e| format!("--hep-transport: {e}"))?;
+                a.given.insert("--hep-transport".into());
+            }
             "--hep-auth-mode" => {
                 a.hep_auth_mode = next("--hep-auth-mode")?
                     .parse()
@@ -251,6 +260,9 @@ fn parse_args_from(argv: &[String]) -> Result<Args, String> {
     }
     if a.hep_auth_file.is_some() && a.hep_send.is_none() {
         return Err("--hep-auth-file has no effect without --hep-send".into());
+    }
+    if a.given.contains("--hep-transport") && a.hep_send.is_none() {
+        return Err("--hep-transport has no effect without --hep-send".into());
     }
     // A mode with no secret is a flag the operator believes is doing something.
     if a.given.contains("--hep-auth-mode") && a.hep_auth_file.is_none() {
@@ -628,7 +640,7 @@ fn main() -> ExitCode {
                     }
                 },
             };
-            match hep::Forwarder::start(target, agent, auth) {
+            match hep::Forwarder::start(target, agent, auth, args.hep_transport) {
                 Ok((f, addr)) => {
                     let how = match f.auth_mode() {
                         None => "unauthenticated",
@@ -636,7 +648,8 @@ fn main() -> ExitCode {
                         Some(hep::AuthMode::Hmac) => "HMAC-signed tokens",
                     };
                     say!(
-                        "  HEP forwarding    : every SIP message to {addr} (agent id {agent}, {how})"
+                        "  HEP forwarding    : every SIP message to {addr} over {} (agent id {agent}, {how})",
+                        args.hep_transport
                     );
                     Some((f, addr))
                 }

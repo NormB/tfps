@@ -338,6 +338,84 @@ pub struct Forwarder {
     shared: Arc<Shared>,
 }
 
+/// How the copies reach the collector.
+///
+/// Homer and its kin accept HEP over either, and the choice is the operator's:
+/// UDP loses a copy rather than blocking the capture when the collector falls
+/// behind, TCP keeps the feed intact across a busy collector and orders it,
+/// at the cost of a connection to maintain. UDP stays the default because it
+/// is what this program has always done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Transport {
+    /// One datagram per message, fire and forget.
+    #[default]
+    Udp,
+    /// One byte stream of packets, each self-delimiting by its HEP length.
+    Tcp,
+}
+
+impl std::str::FromStr for Transport {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "udp" => Ok(Self::Udp),
+            "tcp" => Ok(Self::Tcp),
+            other => Err(format!(
+                "unknown transport \"{other}\", expected udp or tcp"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for Transport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Udp => "udp",
+            Self::Tcp => "tcp",
+        })
+    }
+}
+
+/// A sink that writes whole HEP packets to one TCP collector, reconnecting
+/// when the connection goes.
+///
+/// A collector restarts, and a feed that stopped at the first `EPIPE` would
+/// stay stopped for the life of the daemon while the counter climbed. So the
+/// stream is rebuilt on demand: a failed write drops the connection and the
+/// next packet dials again. One reconnect attempt per packet, never a loop --
+/// the forwarding thread must not spin on a collector that is simply down,
+/// and the failure counter is the honest record of what was lost meanwhile.
+///
+/// `TCP_NODELAY` is set because these are small packets whose value is
+/// timeliness; Nagle would hold a SIP message back waiting for company.
+fn tcp_sink(addr: SocketAddr) -> std::io::Result<Sink> {
+    use std::io::Write;
+    use std::net::TcpStream;
+
+    fn dial(addr: SocketAddr) -> std::io::Result<TcpStream> {
+        let s = TcpStream::connect(addr)?;
+        s.set_nodelay(true)?;
+        Ok(s)
+    }
+
+    // Connect once here so an unreachable collector is an error the operator
+    // sees at startup, exactly as the connected UDP socket gives them.
+    let mut conn: Option<TcpStream> = Some(dial(addr)?);
+    Ok(Box::new(move |pkt: &[u8]| {
+        if let Some(s) = conn.as_mut() {
+            match s.write_all(pkt) {
+                Ok(()) => return Ok(()),
+                Err(_) => conn = None,
+            }
+        }
+        let mut s = dial(addr)?;
+        let r = s.write_all(pkt);
+        conn = Some(s);
+        r
+    }))
+}
+
 impl Forwarder {
     /// Opens a UDP socket towards `collector` (`host:port`) and starts the sending thread.
     /// Returns the address the collector resolved to, for the startup report.
@@ -345,6 +423,7 @@ impl Forwarder {
         collector: &str,
         agent_id: u32,
         auth: Option<Auth>,
+        transport: Transport,
     ) -> std::io::Result<(Self, SocketAddr)> {
         use std::net::{Ipv6Addr, ToSocketAddrs, UdpSocket};
         let addr = collector.to_socket_addrs()?.next().ok_or_else(|| {
@@ -355,11 +434,16 @@ impl Forwarder {
         } else {
             SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
         };
-        let sock = UdpSocket::bind(bind)?;
-        // Connected, so an ICMP unreachable comes back as an error on a later send and is
-        // counted, instead of every copy vanishing into a route to nowhere.
-        sock.connect(addr)?;
-        let sink: Sink = Box::new(move |pkt| sock.send(pkt).map(|_| ()));
+        let sink: Sink = match transport {
+            Transport::Udp => {
+                let sock = UdpSocket::bind(bind)?;
+                // Connected, so an ICMP unreachable comes back as an error on a later send
+                // and is counted, instead of every copy vanishing into a route to nowhere.
+                sock.connect(addr)?;
+                Box::new(move |pkt| sock.send(pkt).map(|_| ()))
+            }
+            Transport::Tcp => tcp_sink(addr)?,
+        };
         Ok((Self::spawn(sink, QUEUE, agent_id, auth)?, addr))
     }
 
@@ -681,7 +765,8 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
         let target = collector.local_addr().unwrap();
-        let (f, resolved) = Forwarder::start(&target.to_string(), SPEC_AGENT_ID, None).unwrap();
+        let (f, resolved) =
+            Forwarder::start(&target.to_string(), SPEC_AGENT_ID, None, Transport::Udp).unwrap();
         assert_eq!(resolved, target);
         f.forward(&spec_observed(b"INVITE sip:bob"));
         let mut buf = [0u8; 2048];
@@ -937,5 +1022,133 @@ mod tests {
         assert_eq!("hmac".parse::<AuthMode>(), Ok(AuthMode::Hmac));
         assert!("HMAC".parse::<AuthMode>().is_err());
         assert!("".parse::<AuthMode>().is_err());
+    }
+
+    // ── the transport to the collector ──────────────────────────────────────
+
+    /// The operator names the transport; a collector that speaks TCP is not
+    /// reachable over UDP, and until now there was no way to say so.
+    #[test]
+    fn the_transport_is_named_by_the_operator_and_defaults_to_udp() {
+        assert_eq!("udp".parse::<Transport>().unwrap(), Transport::Udp);
+        assert_eq!("tcp".parse::<Transport>().unwrap(), Transport::Tcp);
+        assert_eq!(
+            "TCP".parse::<Transport>().unwrap(),
+            Transport::Tcp,
+            "case is not a choice"
+        );
+        assert_eq!(
+            Transport::default(),
+            Transport::Udp,
+            "the old behaviour is the default"
+        );
+        let err = "sctp".parse::<Transport>().unwrap_err();
+        assert!(
+            err.contains("udp") && err.contains("tcp"),
+            "the error names the choices: {err}"
+        );
+    }
+
+    /// Over TCP the collector reads one byte stream, and HEP v3 carries its own
+    /// total length, so packets arrive back to back and are read by that length.
+    #[test]
+    fn a_tcp_collector_receives_whole_packets_back_to_back() {
+        use std::io::Read;
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let addr = listener.local_addr().unwrap();
+        let reader = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().expect("accept");
+            s.set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            // Read until both packets are in hand: one `read` returns whatever
+            // happens to have arrived, which is why the first draft of this
+            // test saw a single packet and called it the whole stream.
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                if buf.len() >= 6 {
+                    let first = u16::from_be_bytes([buf[4], buf[5]]) as usize;
+                    if buf.len() >= first * 2 {
+                        break;
+                    }
+                }
+                match s.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+            buf
+        });
+        let (f, _) = Forwarder::start(&addr.to_string(), 7, None, Transport::Tcp)
+            .expect("a TCP collector is reachable");
+        let o = spec_observed(b"OPTIONS sip:x");
+        f.forward(&o);
+        f.forward(&o);
+        let buf = reader.join().expect("reader");
+        assert!(buf.len() >= 12, "two packets arrived: {} octets", buf.len());
+        assert_eq!(&buf[..4], &MAGIC, "the stream starts with a HEP packet");
+        let first = u16::from_be_bytes([buf[4], buf[5]]) as usize;
+        assert_eq!(
+            &buf[first..first + 4],
+            &MAGIC,
+            "the next packet begins exactly where the first one's length says it ends"
+        );
+    }
+
+    /// A collector that goes away and comes back does not end the feed: the
+    /// sink reconnects rather than counting every later packet as failed.
+    #[test]
+    fn a_tcp_sink_reconnects_after_the_collector_drops_the_connection() {
+        use std::io::Read;
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let addr = listener.local_addr().unwrap();
+        let served = std::thread::spawn(move || {
+            // First connection: read a little, then hang up.
+            let (mut s, _) = listener.accept().expect("first accept");
+            let mut b = [0u8; 64];
+            let _ = s.read(&mut b);
+            drop(s);
+            // Second connection: the reconnect. Bounded, so a sink that never
+            // reconnects fails this test instead of hanging it -- which is what
+            // the first draft did, and a hang is not a red.
+            listener.set_nonblocking(true).expect("nonblocking");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut buf = Vec::new();
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut s2, _)) => {
+                        s2.set_read_timeout(Some(Duration::from_secs(2)))
+                            .expect("timeout");
+                        let mut c = [0u8; 4096];
+                        if let Ok(n) = s2.read(&mut c) {
+                            buf.extend_from_slice(&c[..n]);
+                        }
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => break,
+                }
+            }
+            buf
+        });
+        let mut sink = tcp_sink(addr).expect("connect");
+        let pkt = encode(&spec_observed(b"OPTIONS sip:x"), 7).unwrap();
+        let _ = sink(&pkt);
+        // The peer has gone; the first write after that may or may not fail,
+        // and either way the one after it must arrive on a new connection.
+        for _ in 0..3 {
+            let _ = sink(&pkt);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let got = served.join().expect("server");
+        assert!(
+            !got.is_empty(),
+            "a packet arrived on the reconnected socket"
+        );
+        assert_eq!(&got[..4], &MAGIC, "and it is a whole HEP packet");
     }
 }
